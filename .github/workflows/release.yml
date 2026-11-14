@@ -1,0 +1,54 @@
+# Builds dist/ and publishes it as a zip.
+#   push to master -> replaces the rolling pre-release "latest"
+#   push of a tag vX.Y.Z -> a normal release for that version
+name: Release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: windows-latest # the build that is tested by hand is the Windows one (package.ps1)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup default stable-x86_64-pc-windows-gnu
+          rustup target add armv7-unknown-linux-musleabihf
+
+      - name: Test and build
+        run: .\package.ps1
+
+      - name: Zip
+        # Windows' own tar writes zip paths with forward slashes; Compress-Archive does not.
+        run: '& "$env:SystemRoot\System32\tar.exe" -a -cf KindleRDP.zip -C dist documents kindlerdp'
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = "Unzip and copy both folders to the Kindle's root folder."
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            Copy-Item KindleRDP.zip "KindleRDP-$env:GITHUB_REF_NAME.zip"
+            gh release create $env:GITHUB_REF_NAME "KindleRDP-$env:GITHUB_REF_NAME.zip" --title "KindleRDP $env:GITHUB_REF_NAME" --notes $notes
+          } else {
+            gh release delete latest --yes --cleanup-tag 2>$null
+            $global:LASTEXITCODE = 0 # no previous "latest" on the first run
+            gh release create latest KindleRDP.zip --prerelease --target $env:GITHUB_SHA --title "Latest build" --notes "$notes Built from commit $env:GITHUB_SHA."
+          }
+          if ($LASTEXITCODE) { throw 'publishing the release failed' }

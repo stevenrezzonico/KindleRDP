@@ -25,7 +25,6 @@ use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signat
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::app::Ui;
-use crate::config::Config;
 use crate::cred::{self, Pin};
 use crate::device;
 use crate::gesture::{Action, Gestures, Phase, Routed, TouchRouter};
@@ -44,19 +43,21 @@ pub enum Outcome {
     Disconnected,
     /// The user asked to rotate: reconnect at the new size.
     Rotate,
+    /// The user chose another Windows scale for this server: save it and reconnect.
+    Scale(u32),
 }
 
-pub fn run(ui: &mut Ui, settings: &Config, server: &Server, password: String) -> anyhow::Result<Outcome> {
+pub fn run(ui: &mut Ui, scale: u32, server: &Server, password: String) -> anyhow::Result<Outcome> {
     let (w, h) = ui.fb.size();
     let (width, height) = (w as u16, h as u16);
-    let (result, mut framed) = connect(settings, server, password, width, height)?;
+    let (result, mut framed) = connect(scale, server, password, width, height)?;
     if (result.desktop_size.width, result.desktop_size.height) != (width, height) {
         bail!("server refused {width}x{height}, offered {}x{}", result.desktop_size.width, result.desktop_size.height);
     }
-    session(result, &mut framed, ui, width, height, Scheduler::new(Rect { x: 0, y: 0, w, h }))
+    session(result, &mut framed, ui, width, height, scale, Scheduler::new(Rect { x: 0, y: 0, w, h }))
 }
 
-fn connect(settings: &Config, cfg: &Server, password: String, width: u16, height: u16) -> anyhow::Result<(ConnectionResult, Framed)> {
+fn connect(scale: u32, cfg: &Server, password: String, width: u16, height: u16) -> anyhow::Result<(ConnectionResult, Framed)> {
     use std::net::ToSocketAddrs as _;
     let rdp_config = connector::Config {
         credentials: Credentials::UsernamePassword { username: cfg.user.clone(), password },
@@ -88,7 +89,7 @@ fn connect(settings: &Config, cfg: &Server, password: String, width: u16, height
             | PerformanceFlags::DISABLE_MENUANIMATIONS
             | PerformanceFlags::DISABLE_THEMING
             | PerformanceFlags::DISABLE_CURSOR_SHADOW,
-        desktop_scale_factor: settings.scale,
+        desktop_scale_factor: scale,
         hardware_id: None,
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
@@ -244,7 +245,15 @@ fn touch_channel_ready(stage: &mut ActiveStage) -> bool {
         .is_some_and(|client| client.ready() && !client.is_suspended())
 }
 
-fn session(result: ConnectionResult, framed: &mut Framed, ui: &mut Ui, width: u16, height: u16, mut scheduler: Scheduler) -> anyhow::Result<Outcome> {
+fn session(
+    result: ConnectionResult,
+    framed: &mut Framed,
+    ui: &mut Ui,
+    width: u16,
+    height: u16,
+    scale: u32,
+    mut scheduler: Scheduler,
+) -> anyhow::Result<Outcome> {
     let activation = result.activation_factory;
     let mut stage: ActiveStage = ActiveStageBuilder {
         static_channels: result.static_channels,
@@ -354,10 +363,29 @@ fn session(result: ConnectionResult, framed: &mut Framed, ui: &mut Ui, width: u1
         send_outputs(framed, stage.process_fastpath_input(&mut image, &events)?)?;
 
         if menu {
-            let choice = ui.dialog("KindleRDP", &["Keyboard", "Disconnect", "Rotate screen", "Back to Windows"])?;
-            if choice == 1 || choice == 2 {
+            ui.forget();
+            let choice = ui.dialog("KindleRDP", &["Keyboard", "Scale", "Disconnect", "Rotate screen", "Back to Windows"])?;
+            let mut leave = match choice {
+                2 => Some(Outcome::Disconnected),
+                3 => Some(Outcome::Rotate),
+                _ => None,
+            };
+            let mut wanted = scale / 25 * 25;
+            while choice == 1 {
+                let buttons = ["Smaller", "Larger", "Apply (reconnects)", "Cancel"];
+                match ui.dialog(&format!("Windows scale for this server: {wanted} %"), &buttons)? {
+                    0 => wanted = (wanted - 25).max(100),
+                    1 => wanted = (wanted + 25).min(500),
+                    2 => {
+                        leave = (wanted != scale).then_some(Outcome::Scale(wanted));
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            if let Some(outcome) = leave {
                 send_outputs(framed, stage.graceful_shutdown()?)?;
-                return Ok(if choice == 1 { Outcome::Disconnected } else { Outcome::Rotate });
+                return Ok(outcome);
             }
             // The menu overwrote the session picture: put it back, with a cleaning flash.
             ui.forget();

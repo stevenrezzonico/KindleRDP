@@ -2,3 +2,5 @@
 *.ini text eol=lf
 *.png binary
 *.a binary
+tools/zigcc text eol=lf
+tools/zigar text eol=lf

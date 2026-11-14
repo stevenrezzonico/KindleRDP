@@ -40,9 +40,9 @@ On the server list: tap **Add**, fill in host, user and password, **Save**, then
 | Two fingers moving | Pinch zoom |
 | Two fingers resting 0.7 s | KindleRDP menu |
 
-The menu offers **Keyboard** (toggles the Windows On-Screen Keyboard), **Disconnect**, **Rotate screen** and **Back to Windows** (which also refreshes the whole screen).
+The menu offers **Keyboard** (toggles the Windows On-Screen Keyboard), **Scale** (Windows display scale for this server; reconnects), **Disconnect**, **Rotate screen** and **Back to Windows** (which also refreshes the whole screen).
 
-**Settings** on the server list changes the Windows display scale and the contrast. The same values live in `kindlerdp/config.ini`, which the app creates on first start.
+**Settings** on the server list changes the default Windows display scale and the contrast. A server can have its own scale: the **Scale %** field in its editor, or **Scale** in the menu. Empty means the default. The same values live in `kindlerdp/config.ini`, which the app creates on first start.
 
 If something fails, the reason is shown on screen and written to `kindlerdp/log.txt`.
 
@@ -53,7 +53,9 @@ If something fails, the reason is shown on screen and written to `kindlerdp/log.
 
 ## Build
 
-On Windows, with [rustup](https://rustup.rs) and [zig](https://ziglang.org):
+Both need [rustup](https://rustup.rs) and [zig](https://ziglang.org) on the `PATH`. Zig is only used as the C compiler for the crypto library; Rust links the binary itself.
+
+### Windows
 
 ```powershell
 rustup default stable-x86_64-pc-windows-gnu
@@ -61,7 +63,18 @@ rustup target add armv7-unknown-linux-musleabihf
 .\package.ps1
 ```
 
-`package.ps1` runs the unit tests, cross-compiles for the Kindle and fills `dist\`. Zig is only used as the C compiler for the crypto library.
+`package.ps1` runs the unit tests, cross-compiles for the Kindle and fills `dist\`.
+
+### Linux
+
+Not yet tested on a Linux machine; please report what breaks.
+
+```sh
+rustup target add armv7-unknown-linux-musleabihf
+./package.sh
+```
+
+`package.sh` cross-compiles for the Kindle and fills `dist/`. It does not run the unit tests: on Linux `cargo test` also builds the device code for the build machine, which needs a C compiler there.
 
 ## Limits
 

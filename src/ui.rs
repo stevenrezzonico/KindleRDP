@@ -197,13 +197,13 @@ pub enum FormHit {
     Delete,
 }
 
-pub const FIELDS: [&str; 6] = ["Name", "Host", "Port", "User", "Domain", "Password"];
+pub const FIELDS: [&str; 7] = ["Name", "Host", "Port", "User", "Domain", "Password", "Scale %"];
 const PASSWORD: usize = 5;
 
 /// The server editor's state.
 #[derive(Clone)]
 pub struct Form {
-    pub fields: [String; 6],
+    pub fields: [String; 7],
     pub active: usize,
     pub layer: Layer,
     /// Shown under the buttons: what is wrong, or a hint.
@@ -215,7 +215,10 @@ pub struct Form {
 impl Form {
     pub fn new(server: Option<&Server>, saved_password: bool) -> Self {
         let fields = match server {
-            Some(s) => [s.name.clone(), s.host.clone(), s.port.to_string(), s.user.clone(), s.domain.clone(), String::new()],
+            Some(s) => {
+                let scale = s.scale.map(|v| v.to_string()).unwrap_or_default();
+                [s.name.clone(), s.host.clone(), s.port.to_string(), s.user.clone(), s.domain.clone(), String::new(), scale]
+            }
             None => Default::default(),
         };
         let note = if saved_password { "Password is saved. Type to replace it." } else { "" };
@@ -331,7 +334,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// A message with up to four stacked buttons; returns each button's area in order.
+/// A message with up to five stacked buttons; returns each button's area in order.
 pub fn dialog_screen(c: &mut Canvas, text: &str, buttons: &[&str]) -> Areas<usize> {
     let lines = wrap(text, ((c.w - 2 * MARGIN) / 32) as usize);
     for (i, line) in lines.iter().enumerate() {
@@ -418,7 +421,7 @@ mod tests {
     use super::*;
 
     fn servers(n: usize) -> Vec<Server> {
-        (0..n).map(|i| Server { name: format!("pc{i}"), host: "h".into(), port: 3389, user: "u".into(), domain: String::new() }).collect()
+        (0..n).map(|i| Server { name: format!("pc{i}"), host: "h".into(), port: 3389, user: "u".into(), domain: String::new(), scale: None }).collect()
     }
 
     fn center(r: Rect) -> (i32, i32) {
@@ -456,7 +459,7 @@ mod tests {
                 assert_eq!(hit(&areas, x, y), Some(want), "{want:?} is covered at {w}x{h}");
                 assert!(r.y >= 0 && r.y + r.h <= h && r.x + r.w <= w, "{want:?} off screen at {w}x{h}");
             };
-            for want in [FormHit::Save, FormHit::Cancel, FormHit::Field(5), FormHit::Key(Key::Char('q')), FormHit::Key(Key::Backspace)] {
+            for want in [FormHit::Save, FormHit::Cancel, FormHit::Field(0), FormHit::Field(6), FormHit::Key(Key::Char('1')), FormHit::Key(Key::Backspace)] {
                 tap(&form, want);
             }
             form.press(Key::Char('p'));
@@ -524,12 +527,16 @@ mod tests {
     fn wrapping_and_dialog() {
         assert_eq!(wrap("connection lost: timeout", 12), ["connection", "lost:", "timeout"]);
         assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        for (w, h) in [(1236, 1648), (1648, 1236)] {
+            let mut c = Canvas::new(w, h);
+            let areas = dialog_screen(&mut c, "Menu", &["Keyboard", "Scale", "Disconnect", "Rotate", "Close"]);
+            assert_eq!(areas.len(), 5);
+            let (x, y) = center(areas[4].0);
+            assert_eq!(hit(&areas, x, y), Some(4));
+            assert!(areas[0].0.y > 80 + 72 && areas[4].0.y + areas[4].0.h <= h, "buttons clear the text at {w}x{h}");
+        }
         let mut c = Canvas::new(1236, 1648);
-        let areas = dialog_screen(&mut c, "Menu", &["Disconnect", "Rotate", "Close"]);
-        assert_eq!(areas.len(), 3);
-        let (x, y) = center(areas[2].0);
-        assert_eq!(hit(&areas, x, y), Some(2));
-        assert!(areas[2].0.y + areas[2].0.h <= c.h);
+        dialog_screen(&mut c, "Menu", &["Close"]);
         assert!(c.buf.contains(&0));
     }
 

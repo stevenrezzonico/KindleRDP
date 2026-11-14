@@ -75,7 +75,6 @@ impl Ui {
 
     /// Show a message with buttons; returns the index of the one tapped.
     pub fn dialog(&mut self, text: &str, buttons: &[&str]) -> anyhow::Result<usize> {
-        self.forget();
         let mut canvas = self.canvas();
         let areas = ui::dialog_screen(&mut canvas, text, buttons);
         self.show(canvas);
@@ -168,7 +167,7 @@ impl App {
         if old.host.is_empty() || old.user.is_empty() {
             return Ok(());
         }
-        let server = Server { name: old.host.clone(), host: old.host.clone(), port: old.port, user: old.user.clone(), domain: old.domain.clone().unwrap_or_default() };
+        let server = Server { name: old.host.clone(), host: old.host.clone(), port: old.port, user: old.user.clone(), domain: old.domain.clone().unwrap_or_default(), scale: None };
         let password = old
             .password
             .clone()
@@ -287,11 +286,15 @@ impl App {
                 return Ok(());
             };
             self.ui.dialog(&format!("Connecting to {}...", server.name), &[])?;
-            let outcome = rdp::run(&mut self.ui, &self.settings, &server, password);
+            let outcome = rdp::run(&mut self.ui, server.scale.unwrap_or(self.settings.scale), &server, password);
             self.ui.forget();
             match outcome {
                 Ok(Outcome::Disconnected) => return Ok(()),
                 Ok(Outcome::Rotate) => self.ui.rotate(),
+                Ok(Outcome::Scale(scale)) => {
+                    self.servers[index].scale = Some(scale);
+                    self.save_servers()?;
+                }
                 Err(e) => {
                     eprintln!("{}: {e:#}", server.name);
                     self.ui.dialog(&format!("{}: {e:#}", server.name), &["OK"])?;
