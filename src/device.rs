@@ -1,5 +1,6 @@
 //! Kindle hardware: framebuffer, e-ink refresh through the fbink tool, touch screen, state files.
 
+use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, RawFd};
@@ -89,19 +90,46 @@ struct FixInfo {
     reserved: [u16; 2],
 }
 
+/// Waveform by name: (driver id, ms one update keeps its area busy, limited to black/white-ish).
+/// Ids are MTK_WAVEFORM_MODE_* from the Kindle kernel's hwtcon_ioctl_cmd.h.
+pub fn waveform(name: &str) -> Option<(u32, u64, bool)> {
+    Some(match name {
+        "A2" => (6, 120, true),
+        "DU" => (1, 260, true),
+        "DU4" => (7, 290, true),
+        "GL16" => (3, 450, false),
+        "REAGL" => (4, 450, false),
+        "GC16" => (2, 450, false),
+        "AUTO" => (257, 450, false),
+        _ => return None,
+    })
+}
+
+/// MXCFB_SEND_UPDATE_MTK: _IOW('F', 0x2E, struct mxcfb_update_data_mtk), 24 u32 fields.
+const SEND_UPDATE: u32 = (1 << 30) | (96 << 16) | ((b'F' as u32) << 8) | 0x2E;
+const TEMP_USE_AMBIENT: u32 = 0x1000;
+
 /// The panel, driven in landscape: session (x, y) maps to framebuffer (fb_w - 1 - y, x).
 // shortcut: fixed 90° rotation and 8-bit gray only; add a config key and 32bpp for other models.
 pub struct Fb {
+    file: File,
     map: *mut u8,
     len: usize,
     fb_w: i32,
     fb_h: i32,
     stride: usize,
     fast: String,
+    fast_id: u32,
+    gamma: [u8; 256],
+    marker: Cell<u32>,
+    /// Set after the direct ioctl failed once (not an MTK panel): use the fbink tool from then on.
+    via_fbink: Cell<bool>,
 }
 
 impl Fb {
-    pub fn open(fast_waveform: &str) -> anyhow::Result<Self> {
+    pub fn open(fast_waveform: &str, gamma: f32) -> anyhow::Result<Self> {
+        let (fast_id, ..) = waveform(fast_waveform).with_context(|| format!("unknown fast_waveform '{fast_waveform}'"))?;
+        let gamma = std::array::from_fn(|i| ((i as f32 / 255.0).powf(gamma) * 255.0).round() as u8);
         let f = OpenOptions::new().read(true).write(true).open("/dev/fb0").context("open /dev/fb0")?;
         let mut var = [0u32; 40]; // struct fb_var_screeninfo: 0 = xres, 1 = yres, 6 = bits_per_pixel
         let mut fix = FixInfo::default();
@@ -126,7 +154,19 @@ impl Fb {
         if map == libc::MAP_FAILED {
             bail!("mmap /dev/fb0: {}", std::io::Error::last_os_error());
         }
-        Ok(Self { map: map.cast(), len, fb_w, fb_h, stride, fast: fast_waveform.to_owned() })
+        Ok(Self {
+            file: f,
+            map: map.cast(),
+            len,
+            fb_w,
+            fb_h,
+            stride,
+            fast: fast_waveform.to_owned(),
+            fast_id,
+            gamma,
+            marker: Cell::new(0),
+            via_fbink: Cell::new(false),
+        })
     }
 
     /// Session size: landscape, width a multiple of 4 as RDP servers expect.
@@ -147,14 +187,33 @@ impl Fb {
             let row = &rgba[(y as usize * img_w + r.x as usize) * 4..][..r.w as usize * 4];
             for (i, px) in row.chunks_exact(4).enumerate() {
                 let gray = (px[0] as u32 * 77 + px[1] as u32 * 150 + px[2] as u32 * 29) >> 8;
-                fb[(r.x as usize + i) * self.stride + col] = gray as u8;
+                fb[(r.x as usize + i) * self.stride + col] = self.gamma[gray as usize];
             }
         }
     }
 
     pub fn refresh(&self, r: Rect, wave: Wave) {
-        let region = format!("top={},left={},width={},height={}", r.x, self.fb_w - r.y - r.h, r.h, r.w);
-        // shortcut: one fbink process per refresh (~10 ms each); link libfbink if that shows up as lag.
+        let (top, left, width, height) = (r.x, self.fb_w - r.y - r.h, r.h, r.w);
+        if !self.via_fbink.get() {
+            let (mode, full) = match wave {
+                Wave::Fast => (self.fast_id, 0),
+                Wave::Quality => (3, 0), // GL16
+                Wave::Full => (2, 1),    // GC16, flashing
+            };
+            self.marker.set(self.marker.get().wrapping_add(1).max(1));
+            let mut update = [0u32; 24];
+            update[..7].copy_from_slice(&[top as u32, left as u32, width as u32, height as u32, mode, full, self.marker.get()]);
+            update[7] = TEMP_USE_AMBIENT;
+            update[20] = 1; // AUTO: DU for black/white areas
+            update[21] = 3; // AUTO: GL16 for gray areas
+            // SAFETY: `update` has the size encoded in the request and outlives the call.
+            if unsafe { libc::ioctl(self.file.as_raw_fd(), SEND_UPDATE as _, update.as_mut_ptr()) } == 0 {
+                return;
+            }
+            eprintln!("direct refresh failed ({}), using the fbink tool", std::io::Error::last_os_error());
+            self.via_fbink.set(true);
+        }
+        let region = format!("top={top},left={left},width={width},height={height}");
         match wave {
             Wave::Fast => fbink(&["-s", &region, "-W", &self.fast]),
             Wave::Quality => fbink(&["-s", &region, "-W", "GL16"]),

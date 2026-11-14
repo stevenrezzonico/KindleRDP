@@ -57,7 +57,8 @@ fn run() -> anyhow::Result<()> {
             .context("no saved password for this host: add password = ... to config.ini")?,
     };
 
-    let fb = Fb::open(&cfg.fast_waveform)?;
+    let fb = Fb::open(&cfg.fast_waveform, cfg.gamma)?;
+    let (_, busy_ms, settle) = device::waveform(&cfg.fast_waveform).context("unknown fast_waveform")?;
     let (fb_w, fb_h) = fb.fb_size();
     let mut touch = TouchScreen::open(fb_w, fb_h)?;
     let (width, height) = fb.session_size();
@@ -78,7 +79,7 @@ fn run() -> anyhow::Result<()> {
     if (result.desktop_size.width, result.desktop_size.height) != (width, height) {
         bail!("server refused {width}x{height}, offered {}x{}", result.desktop_size.width, result.desktop_size.height);
     }
-    session(result, &mut framed, &fb, &mut touch, width, height)
+    session(result, &mut framed, &fb, &mut touch, width, height, Scheduler::new(Rect { x: 0, y: 0, w: i32::from(width), h: i32::from(height) }, busy_ms, settle))
 }
 
 fn connect(cfg: &Config, password: String, width: u16, height: u16) -> anyhow::Result<(ConnectionResult, Framed)> {
@@ -243,7 +244,7 @@ fn send(framed: &mut Framed, frame: &[u8]) -> anyhow::Result<()> {
     sent.context("send")
 }
 
-fn session(result: ConnectionResult, framed: &mut Framed, fb: &Fb, touch: &mut TouchScreen, width: u16, height: u16) -> anyhow::Result<()> {
+fn session(result: ConnectionResult, framed: &mut Framed, fb: &Fb, touch: &mut TouchScreen, width: u16, height: u16, mut scheduler: Scheduler) -> anyhow::Result<()> {
     let activation = result.activation_factory;
     let mut stage: ActiveStage = ActiveStageBuilder {
         static_channels: result.static_channels,
@@ -259,7 +260,6 @@ fn session(result: ConnectionResult, framed: &mut Framed, fb: &Fb, touch: &mut T
 
     let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
     let screen = Rect { x: 0, y: 0, w: i32::from(width), h: i32::from(height) };
-    let mut scheduler = Scheduler::new(screen);
     let mut gestures = Gestures::new(screen.w);
     let mut input = Database::new();
     let start = Instant::now();

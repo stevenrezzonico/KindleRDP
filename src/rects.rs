@@ -45,32 +45,55 @@ pub fn add(list: &mut Vec<Rect>, mut r: Rect) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wave {
-    /// Quick, 1-bit, ghosts. Used while the screen is still changing.
+    /// The configured waveform, used for every change as it arrives.
     Fast,
-    /// 16 grays, no flash. Cleans up an area once it stops changing.
+    /// 16 grays, no flash. Cleans up after a black/white Fast waveform.
     Quality,
     /// Flashing full-screen update. Clears accumulated ghosting.
     Full,
 }
 
-const FLUSH_MS: u64 = 120;
-const SETTLE_MS: u64 = 600;
-const FULL_EVERY: u32 = 20;
+const FLUSH_MS: u64 = 30;
+const SETTLE_MS: u64 = 400;
+const QUALITY_BUSY_MS: u64 = 450;
+const FULL_BUSY_MS: u64 = 600;
+const FULL_EVERY: u32 = 40;
+const IDLE_FULL_MS: u64 = 1500;
 
 /// Decides when to refresh which area with which waveform. Times are milliseconds.
+///
+/// The panel cannot restart an area that is still mid-update: such a request queues in the
+/// driver and everything behind it lags. So an area is held back here until its previous
+/// update is done, and by then all newer damage to it has merged into one refresh.
 pub struct Scheduler {
     screen: Rect,
+    /// How long one Fast update keeps its area busy.
+    busy_ms: u64,
+    /// Fast waveform cannot show grays: follow up with a Quality pass once the area is quiet.
+    settle: bool,
     pending: Vec<Rect>,
     first_pending: u64,
+    inflight: Vec<(Rect, u64)>,
     unsettled: Option<Rect>,
-    last_fast: u64,
-    quality_passes: u32,
+    last_flush: u64,
+    flushes: u32,
     force_full: bool,
 }
 
 impl Scheduler {
-    pub fn new(screen: Rect) -> Self {
-        Self { screen, pending: Vec::new(), first_pending: 0, unsettled: None, last_fast: 0, quality_passes: 0, force_full: false }
+    pub fn new(screen: Rect, busy_ms: u64, settle: bool) -> Self {
+        Self {
+            screen,
+            busy_ms,
+            settle,
+            pending: Vec::new(),
+            first_pending: 0,
+            inflight: Vec::new(),
+            unsettled: None,
+            last_flush: 0,
+            flushes: 0,
+            force_full: false,
+        }
     }
 
     pub fn damage(&mut self, r: Rect, now: u64) {
@@ -89,44 +112,64 @@ impl Scheduler {
         if self.force_full {
             Some(0)
         } else if !self.pending.is_empty() {
-            Some((self.first_pending + FLUSH_MS).saturating_sub(now))
+            let flush_at = self.first_pending + FLUSH_MS;
+            if now < flush_at {
+                Some(flush_at - now)
+            } else {
+                Some(self.inflight.iter().map(|(_, until)| until.saturating_sub(now)).min().unwrap_or(0))
+            }
         } else if self.unsettled.is_some() {
-            Some((self.last_fast + SETTLE_MS).saturating_sub(now))
+            Some((self.last_flush + SETTLE_MS).saturating_sub(now))
+        } else if self.flushes >= FULL_EVERY {
+            Some((self.last_flush + IDLE_FULL_MS).saturating_sub(now))
         } else {
             None
         }
     }
 
+    fn full(&mut self, now: u64) -> Vec<(Rect, Wave)> {
+        self.force_full = false;
+        self.pending.clear();
+        self.unsettled = None;
+        self.flushes = 0;
+        self.inflight = vec![(self.screen, now + FULL_BUSY_MS)];
+        vec![(self.screen, Wave::Full)]
+    }
+
     /// Refreshes to perform now.
     pub fn tick(&mut self, now: u64) -> Vec<(Rect, Wave)> {
+        self.inflight.retain(|(_, until)| *until > now);
         if self.force_full {
-            self.force_full = false;
-            self.pending.clear();
-            self.unsettled = None;
-            self.quality_passes = 0;
-            return vec![(self.screen, Wave::Full)];
+            return self.full(now);
         }
         if !self.pending.is_empty() {
             if now < self.first_pending + FLUSH_MS {
                 return Vec::new();
             }
-            let out: Vec<_> = self.pending.drain(..).map(|r| (r, Wave::Fast)).collect();
-            for (r, _) in &out {
-                self.unsettled = Some(self.unsettled.map_or(*r, |u| u.union(*r)));
+            let (blocked, ready): (Vec<Rect>, Vec<Rect>) =
+                self.pending.drain(..).partition(|r| self.inflight.iter().any(|(busy, _)| busy.near(*r, 0)));
+            self.pending = blocked;
+            if ready.is_empty() {
+                return Vec::new();
             }
-            self.last_fast = now;
-            return out;
+            for r in &ready {
+                self.inflight.push((*r, now + self.busy_ms));
+                if self.settle {
+                    self.unsettled = Some(self.unsettled.map_or(*r, |u| u.union(*r)));
+                }
+            }
+            self.last_flush = now;
+            self.flushes += 1;
+            return ready.into_iter().map(|r| (r, Wave::Fast)).collect();
         }
-        if let Some(area) = self.unsettled
-            && now >= self.last_fast + SETTLE_MS
-        {
-            self.unsettled = None;
-            self.quality_passes += 1;
-            if self.quality_passes >= FULL_EVERY {
-                self.quality_passes = 0;
-                return vec![(self.screen, Wave::Full)];
+        if let Some(area) = self.unsettled {
+            if now >= self.last_flush + SETTLE_MS {
+                self.unsettled = None;
+                self.inflight.push((area, now + QUALITY_BUSY_MS));
+                return vec![(area, Wave::Quality)];
             }
-            return vec![(area, Wave::Quality)];
+        } else if self.flushes >= FULL_EVERY && now >= self.last_flush + IDLE_FULL_MS {
+            return self.full(now); // ghosting has built up and the screen is idle: clean it
         }
         Vec::new()
     }
@@ -167,37 +210,59 @@ mod tests {
     }
 
     #[test]
-    fn fast_then_quality_then_idle() {
-        let mut s = Scheduler::new(r(0, 0, 1000, 1000));
+    fn single_change_shows_at_once_without_second_pass() {
+        let mut s = Scheduler::new(r(0, 0, 1000, 1000), 450, false);
         assert_eq!(s.wait(0), None);
         s.damage(r(0, 0, 10, 10), 1000);
-        assert_eq!(s.wait(1000), Some(120));
-        assert!(s.tick(1050).is_empty());
-        assert_eq!(s.tick(1120), vec![(r(0, 0, 10, 10), Wave::Fast)]);
-        // more damage before settling: area grows, settle timer restarts
-        s.damage(r(100, 100, 10, 10), 1200);
-        assert_eq!(s.tick(1320), vec![(r(100, 100, 10, 10), Wave::Fast)]);
-        assert!(s.tick(1800).is_empty());
-        assert_eq!(s.tick(1920), vec![(r(0, 0, 110, 110), Wave::Quality)]);
-        assert_eq!(s.wait(2000), None);
+        assert_eq!(s.wait(1000), Some(30));
+        assert!(s.tick(1010).is_empty());
+        assert_eq!(s.tick(1030), vec![(r(0, 0, 10, 10), Wave::Fast)]);
+        assert_eq!(s.wait(1030), None);
+        assert!(s.tick(5000).is_empty());
     }
 
     #[test]
-    fn full_flash_periodic_and_on_request() {
+    fn busy_area_waits_other_area_does_not() {
+        let mut s = Scheduler::new(r(0, 0, 1000, 1000), 450, false);
+        s.damage(r(0, 0, 100, 100), 0);
+        assert_eq!(s.tick(30).len(), 1); // busy until 480
+        s.damage(r(50, 50, 10, 10), 100); // same area: must wait
+        s.damage(r(500, 500, 10, 10), 100); // elsewhere: goes out
+        assert_eq!(s.tick(130), vec![(r(500, 500, 10, 10), Wave::Fast)]);
+        assert_eq!(s.wait(130), Some(350));
+        s.damage(r(60, 60, 20, 20), 300); // merges into the waiting rect
+        assert!(s.tick(479).is_empty());
+        assert_eq!(s.tick(480), vec![(r(50, 50, 30, 30), Wave::Fast)]);
+    }
+
+    #[test]
+    fn black_white_waveform_gets_quality_pass() {
+        let mut s = Scheduler::new(r(0, 0, 1000, 1000), 120, true);
+        s.damage(r(0, 0, 10, 10), 1000);
+        assert_eq!(s.tick(1030), vec![(r(0, 0, 10, 10), Wave::Fast)]);
+        s.damage(r(100, 100, 10, 10), 1200);
+        assert_eq!(s.tick(1230), vec![(r(100, 100, 10, 10), Wave::Fast)]);
+        assert!(s.tick(1600).is_empty());
+        assert_eq!(s.tick(1630), vec![(r(0, 0, 110, 110), Wave::Quality)]);
+        assert_eq!(s.wait(1700), None);
+    }
+
+    #[test]
+    fn full_flash_when_idle_after_many_updates_and_on_request() {
         let screen = r(0, 0, 1000, 1000);
-        let mut s = Scheduler::new(screen);
+        let mut s = Scheduler::new(screen, 100, false);
         let mut now = 0;
-        let mut last = Vec::new();
         for _ in 0..FULL_EVERY {
             s.damage(r(0, 0, 10, 10), now);
-            now += FLUSH_MS;
-            s.tick(now);
-            now += SETTLE_MS;
-            last = s.tick(now);
+            now += 200;
+            assert_eq!(s.tick(now).len(), 1);
         }
-        assert_eq!(last, vec![(screen, Wave::Full)]);
+        assert_eq!(s.wait(now), Some(IDLE_FULL_MS));
+        assert!(s.tick(now + 1000).is_empty());
+        assert_eq!(s.tick(now + IDLE_FULL_MS), vec![(screen, Wave::Full)]);
+        assert_eq!(s.wait(now + IDLE_FULL_MS), None);
         s.request_full();
         assert_eq!(s.wait(now), Some(0));
-        assert_eq!(s.tick(now), vec![(screen, Wave::Full)]);
+        assert_eq!(s.tick(now + 5000), vec![(screen, Wave::Full)]);
     }
 }

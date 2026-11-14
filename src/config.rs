@@ -1,7 +1,7 @@
 //! config.ini parsing. The file lives on the USB-visible partition, so the password
 //! is moved out of it after the first successful login (see cred.rs).
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct Config {
     pub host: String,
     pub port: u16,
@@ -10,8 +10,10 @@ pub struct Config {
     pub password: Option<String>,
     /// Windows display scaling in percent (100-500).
     pub scale: u32,
-    /// fbink waveform name used while the screen is changing.
+    /// Waveform name for screen changes (see device::waveform).
     pub fast_waveform: String,
+    /// Above 1 darkens mid-grays so pale Windows UI stays visible on e-ink.
+    pub gamma: f32,
     pub fbink: Option<String>,
 }
 
@@ -23,7 +25,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
         domain: None,
         password: None,
         scale: 200,
-        fast_waveform: "A2".into(),
+        fast_waveform: "GL16".into(),
+        gamma: 1.0,
         fbink: None,
     };
     for (n, line) in text.lines().enumerate() {
@@ -42,7 +45,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
             "domain" => c.domain = Some(value).filter(|v| !v.is_empty()),
             "password" => c.password = Some(value).filter(|v| !v.is_empty()),
             "scale" => c.scale = value.parse().ok().filter(|s| (100..=500).contains(s)).ok_or(number("scale (100-500)"))?,
-            "fast_waveform" => c.fast_waveform = value,
+            "fast_waveform" => c.fast_waveform = value.to_uppercase(),
+            "gamma" => c.gamma = value.parse().ok().filter(|g| (0.5..=3.0).contains(g)).ok_or(number("gamma (0.5-3.0)"))?,
             "fbink" => c.fbink = Some(value),
             _ => return Err(format!("line {}: unknown key '{key}'", n + 1)),
         }
@@ -84,6 +88,8 @@ mod tests {
         assert!(parse("user=a").is_err());
         assert!(parse("host=a\nuser=b\nport=x").is_err());
         assert!(parse("host=a\nuser=b\nscale=50").is_err());
+        assert!(parse("host=a\nuser=b\ngamma=9").is_err());
+        assert_eq!(parse("host=a\nuser=b\ngamma=1.5\nfast_waveform=du").unwrap().fast_waveform, "DU");
         assert!(parse("host=a\nuser=b\nhots=c").is_err());
         assert!(parse("host=a\nuser=b\njunk").is_err());
     }
