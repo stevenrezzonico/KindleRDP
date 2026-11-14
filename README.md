@@ -67,14 +67,14 @@ rustup target add armv7-unknown-linux-musleabihf
 
 ### Linux
 
-Not yet tested on a Linux machine; please report what breaks.
+Tested on Ubuntu 26.04 (under WSL) with Rust 1.100 and zig 0.17.1. Neither needs root: rustup installs into your home folder, and zig is one archive from [ziglang.org/download](https://ziglang.org/download/) to unpack, with its `zig` program put on the `PATH`.
 
 ```sh
 rustup target add armv7-unknown-linux-musleabihf
 ./package.sh
 ```
 
-`package.sh` cross-compiles for the Kindle and fills `dist/`. It does not run the unit tests: on Linux `cargo test` also builds the device code for the build machine, which needs a C compiler there.
+`package.sh` cross-compiles for the Kindle and fills `dist/`. It does not run the unit tests. Run them with `cargo test`; on Linux that also builds the device code for the build machine, which needs a C compiler there (`gcc` or `clang`).
 
 ## Limits
 
