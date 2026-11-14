@@ -1,0 +1,25 @@
+[package]
+name = "kindlerdp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+
+# Device-only: host `cargo test` builds none of these.
+[target.'cfg(target_os = "linux")'.dependencies]
+anyhow = "1"
+libc = "0.2"
+ironrdp = { version = "0.17", features = ["session", "connector", "graphics", "input"] }
+ironrdp-blocking = "0.10"
+sspi = { version = "0.21", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,11 @@
+# Cross-build for the Kindle from Windows. Rust links with its own lld and bundled musl;
+# zig is only the C compiler for the `ring` crypto crate.
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+# tools/lib/libdl.a is an empty archive: musl keeps dlopen in libc, but a dependency still asks for -ldl.
+rustflags = ["-C", "target-cpu=cortex-a53", "-L", "native=tools/lib"]
+
+[env]
+CC_armv7_unknown_linux_musleabihf = { value = "tools/zigcc.cmd", relative = true }
+AR_armv7_unknown_linux_musleabihf = { value = "tools/zigar.cmd", relative = true }
+CRATE_CC_NO_DEFAULTS = "1" # zig rejects the --target triple cc-rs adds; zigcc.cmd sets the target
