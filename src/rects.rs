@@ -17,9 +17,51 @@ impl Rect {
         Rect { x, y, w: r - x, h: b - y }
     }
 
+    pub fn contains(self, x: i32, y: i32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+
     /// True when the rects overlap or lie within `gap` pixels of each other.
     fn near(self, o: Rect, gap: i32) -> bool {
         self.x - gap < o.x + o.w && o.x - gap < self.x + self.w && self.y - gap < o.y + o.h && o.y - gap < self.y + self.h
+    }
+}
+
+/// How the session is laid out on the panel. The framebuffer itself is always portrait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rotation {
+    Portrait,
+    /// Session (x, y) is framebuffer (fb_w - 1 - y, x).
+    Landscape,
+}
+
+impl Rotation {
+    pub fn toggled(self) -> Self {
+        if self == Rotation::Portrait { Rotation::Landscape } else { Rotation::Portrait }
+    }
+
+    /// Session size; the width is a multiple of 4 as RDP servers expect.
+    pub fn session_size(self, fb_w: i32, fb_h: i32) -> (i32, i32) {
+        match self {
+            Rotation::Portrait => (fb_w & !3, fb_h),
+            Rotation::Landscape => (fb_h & !3, fb_w),
+        }
+    }
+
+    /// A session rectangle in framebuffer coordinates.
+    pub fn to_fb(self, r: Rect, fb_w: i32) -> Rect {
+        match self {
+            Rotation::Portrait => r,
+            Rotation::Landscape => Rect { x: fb_w - r.y - r.h, y: r.x, w: r.h, h: r.w },
+        }
+    }
+
+    /// A framebuffer point (a touch) in session coordinates.
+    pub fn point_from_fb(self, x: i32, y: i32, fb_w: i32) -> (i32, i32) {
+        match self {
+            Rotation::Portrait => (x, y),
+            Rotation::Landscape => (y, fb_w - 1 - x),
+        }
     }
 }
 
@@ -45,17 +87,17 @@ pub fn add(list: &mut Vec<Rect>, mut r: Rect) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wave {
-    /// The configured waveform, used for every change as it arrives.
+    /// 16 grays, no flash (GL16): every change of the session picture.
     Fast,
-    /// 16 grays, no flash. Cleans up after a black/white Fast waveform.
-    Quality,
     /// Flashing full-screen update. Clears accumulated ghosting.
     Full,
+    /// Black/white, quick: the app's own screens and keyboard.
+    Mono,
 }
 
 const FLUSH_MS: u64 = 30;
-const SETTLE_MS: u64 = 400;
-const QUALITY_BUSY_MS: u64 = 450;
+/// How long one Fast update keeps its area busy.
+const BUSY_MS: u64 = 450;
 const FULL_BUSY_MS: u64 = 600;
 const FULL_EVERY: u32 = 40;
 const IDLE_FULL_MS: u64 = 1500;
@@ -67,29 +109,21 @@ const IDLE_FULL_MS: u64 = 1500;
 /// update is done, and by then all newer damage to it has merged into one refresh.
 pub struct Scheduler {
     screen: Rect,
-    /// How long one Fast update keeps its area busy.
-    busy_ms: u64,
-    /// Fast waveform cannot show grays: follow up with a Quality pass once the area is quiet.
-    settle: bool,
     pending: Vec<Rect>,
     first_pending: u64,
     inflight: Vec<(Rect, u64)>,
-    unsettled: Option<Rect>,
     last_flush: u64,
     flushes: u32,
     force_full: bool,
 }
 
 impl Scheduler {
-    pub fn new(screen: Rect, busy_ms: u64, settle: bool) -> Self {
+    pub fn new(screen: Rect) -> Self {
         Self {
             screen,
-            busy_ms,
-            settle,
             pending: Vec::new(),
             first_pending: 0,
             inflight: Vec::new(),
-            unsettled: None,
             last_flush: 0,
             flushes: 0,
             force_full: false,
@@ -118,8 +152,6 @@ impl Scheduler {
             } else {
                 Some(self.inflight.iter().map(|(_, until)| until.saturating_sub(now)).min().unwrap_or(0))
             }
-        } else if self.unsettled.is_some() {
-            Some((self.last_flush + SETTLE_MS).saturating_sub(now))
         } else if self.flushes >= FULL_EVERY {
             Some((self.last_flush + IDLE_FULL_MS).saturating_sub(now))
         } else {
@@ -130,7 +162,6 @@ impl Scheduler {
     fn full(&mut self, now: u64) -> Vec<(Rect, Wave)> {
         self.force_full = false;
         self.pending.clear();
-        self.unsettled = None;
         self.flushes = 0;
         self.inflight = vec![(self.screen, now + FULL_BUSY_MS)];
         vec![(self.screen, Wave::Full)]
@@ -152,23 +183,12 @@ impl Scheduler {
             if ready.is_empty() {
                 return Vec::new();
             }
-            for r in &ready {
-                self.inflight.push((*r, now + self.busy_ms));
-                if self.settle {
-                    self.unsettled = Some(self.unsettled.map_or(*r, |u| u.union(*r)));
-                }
-            }
+            self.inflight.extend(ready.iter().map(|r| (*r, now + BUSY_MS)));
             self.last_flush = now;
             self.flushes += 1;
             return ready.into_iter().map(|r| (r, Wave::Fast)).collect();
         }
-        if let Some(area) = self.unsettled {
-            if now >= self.last_flush + SETTLE_MS {
-                self.unsettled = None;
-                self.inflight.push((area, now + QUALITY_BUSY_MS));
-                return vec![(area, Wave::Quality)];
-            }
-        } else if self.flushes >= FULL_EVERY && now >= self.last_flush + IDLE_FULL_MS {
+        if self.flushes >= FULL_EVERY && now >= self.last_flush + IDLE_FULL_MS {
             return self.full(now); // ghosting has built up and the screen is idle: clean it
         }
         Vec::new()
@@ -181,6 +201,21 @@ mod tests {
 
     const fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
         Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn rotation_maps_rects_and_points_consistently() {
+        let (fb_w, fb_h) = (1236, 1648);
+        assert_eq!(Rotation::Landscape.session_size(fb_w, fb_h), (1648, 1236));
+        assert_eq!(Rotation::Portrait.session_size(fb_w, fb_h), (1236, 1648));
+        assert_eq!(Rotation::Portrait.to_fb(r(5, 6, 7, 8), fb_w), r(5, 6, 7, 8));
+        // top-left 10x20 of the landscape session is the top-right corner of the panel
+        assert_eq!(Rotation::Landscape.to_fb(r(0, 0, 10, 20), fb_w), r(1216, 0, 20, 10));
+        // a touch inside that panel area lands inside the session rect
+        let (x, y) = Rotation::Landscape.point_from_fb(1220, 3, fb_w);
+        assert!(r(0, 0, 10, 20).contains(x, y), "{x},{y}");
+        assert_eq!(Rotation::Portrait.point_from_fb(3, 4, fb_w), (3, 4));
+        assert_eq!(Rotation::Portrait.toggled().toggled(), Rotation::Portrait);
     }
 
     #[test]
@@ -211,7 +246,7 @@ mod tests {
 
     #[test]
     fn single_change_shows_at_once_without_second_pass() {
-        let mut s = Scheduler::new(r(0, 0, 1000, 1000), 450, false);
+        let mut s = Scheduler::new(r(0, 0, 1000, 1000));
         assert_eq!(s.wait(0), None);
         s.damage(r(0, 0, 10, 10), 1000);
         assert_eq!(s.wait(1000), Some(30));
@@ -223,7 +258,7 @@ mod tests {
 
     #[test]
     fn busy_area_waits_other_area_does_not() {
-        let mut s = Scheduler::new(r(0, 0, 1000, 1000), 450, false);
+        let mut s = Scheduler::new(r(0, 0, 1000, 1000));
         s.damage(r(0, 0, 100, 100), 0);
         assert_eq!(s.tick(30).len(), 1); // busy until 480
         s.damage(r(50, 50, 10, 10), 100); // same area: must wait
@@ -236,25 +271,13 @@ mod tests {
     }
 
     #[test]
-    fn black_white_waveform_gets_quality_pass() {
-        let mut s = Scheduler::new(r(0, 0, 1000, 1000), 120, true);
-        s.damage(r(0, 0, 10, 10), 1000);
-        assert_eq!(s.tick(1030), vec![(r(0, 0, 10, 10), Wave::Fast)]);
-        s.damage(r(100, 100, 10, 10), 1200);
-        assert_eq!(s.tick(1230), vec![(r(100, 100, 10, 10), Wave::Fast)]);
-        assert!(s.tick(1600).is_empty());
-        assert_eq!(s.tick(1630), vec![(r(0, 0, 110, 110), Wave::Quality)]);
-        assert_eq!(s.wait(1700), None);
-    }
-
-    #[test]
     fn full_flash_when_idle_after_many_updates_and_on_request() {
         let screen = r(0, 0, 1000, 1000);
-        let mut s = Scheduler::new(screen, 100, false);
+        let mut s = Scheduler::new(screen);
         let mut now = 0;
         for _ in 0..FULL_EVERY {
             s.damage(r(0, 0, 10, 10), now);
-            now += 200;
+            now += BUSY_MS + 50;
             assert_eq!(s.tick(now).len(), 1);
         }
         assert_eq!(s.wait(now), Some(IDLE_FULL_MS));

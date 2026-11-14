@@ -6,13 +6,15 @@ edition = "2024"
 [dependencies]
 sha2 = "0.10"
 chacha20poly1305 = "0.10"
+spleen-font = { version = "0.2.0", features = ["s16x32", "s32x64"] }
 
 # Device-only: host `cargo test` builds none of these.
 [target.'cfg(target_os = "linux")'.dependencies]
 anyhow = "1"
 libc = "0.2"
-ironrdp = { version = "0.17", features = ["session", "connector", "graphics", "input"] }
+ironrdp = { version = "0.17", features = ["session", "connector", "graphics", "input", "dvc"] }
 ironrdp-blocking = "0.10"
+ironrdp-rdpei = "=0.1.0" # the release built against the same dvc/pdu crates as ironrdp 0.17
 sspi = { version = "0.21", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }

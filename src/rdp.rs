@@ -6,87 +6,61 @@ use std::os::fd::AsRawFd as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, bail};
+use anyhow::{Context as _, anyhow, bail};
 use ironrdp::connector::connection_activation::ConnectionActivationState;
 use ironrdp::connector::{self, ConnectionResult, Credentials, Sequence as _};
+use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
-use ironrdp::input::{Database, MouseButton, MousePosition, Operation, WheelRotations};
+use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp_rdpei::RdpeiClient;
+use ironrdp_rdpei::contact::{TouchFrameBuilder, TouchPhase};
+use ironrdp_rdpei::pdu::{CsReadyFlags, RdpInputProtocolVersion};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
-use crate::config::{self, Config};
+use crate::app::Ui;
+use crate::config::Config;
 use crate::cred::{self, Pin};
-use crate::device::{self, Fb, TouchScreen};
-use crate::gesture::{Action, Gestures};
+use crate::device;
+use crate::gesture::{Action, Gestures, Phase, Routed, TouchRouter};
 use crate::rects::{Rect, Scheduler};
+use crate::servers::Server;
 
 type Framed = ironrdp_blocking::Framed<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
 
-pub fn main() -> i32 {
-    match run() {
-        Ok(()) => 0,
-        Err(e) => {
-            device::message(&format!("KindleRDP: {e:#}"));
-            std::thread::sleep(Duration::from_secs(5)); // time to read it before the Kindle UI returns
-            1
-        }
-    }
+/// Touch contacts Windows may get at once.
+const MAX_CONTACTS: u16 = 5;
+/// How often resting fingers are restated to Windows.
+const KEEPALIVE_MS: u64 = 100;
+
+/// Why a session ended without an error.
+pub enum Outcome {
+    Disconnected,
+    /// The user asked to rotate: reconnect at the new size.
+    Rotate,
 }
 
-fn run() -> anyhow::Result<()> {
-    let dir = std::env::current_exe()?.parent().context("exe has no directory")?.to_owned();
-    let config_path = dir.join("config.ini");
-    let config_text = std::fs::read_to_string(&config_path).with_context(|| format!("read {}", config_path.display()))?;
-    let cfg = config::parse(&config_text).map_err(anyhow::Error::msg)?;
-    device::set_fbink(cfg.fbink.as_deref());
-
-    let account = format!("{}@{}:{}", cfg.user, cfg.host, cfg.port);
-    let serial = device::serial();
-    let cred_path = device::state("cred");
-    let password = match &cfg.password {
-        Some(p) => p.clone(),
-        None => std::fs::read(&cred_path)
-            .ok()
-            .and_then(|blob| cred::open(&serial, &account, &blob))
-            .context("no saved password for this host: add password = ... to config.ini")?,
-    };
-
-    let fb = Fb::open(&cfg.fast_waveform, cfg.gamma)?;
-    let (_, busy_ms, settle) = device::waveform(&cfg.fast_waveform).context("unknown fast_waveform")?;
-    let (fb_w, fb_h) = fb.fb_size();
-    let mut touch = TouchScreen::open(fb_w, fb_h)?;
-    let (width, height) = fb.session_size();
-
-    device::message(&format!("Connecting to {}...", cfg.host));
-    let (result, mut framed) = connect(&cfg, password.clone(), width, height)?;
-
-    // Login worked: move the password off the USB-visible partition.
-    if cfg.password.is_some() {
-        let saved = device::random_nonce()
-            .and_then(|nonce| device::write_private(&cred_path, &cred::seal(&serial, &account, nonce, &password)));
-        match saved {
-            Ok(()) => std::fs::write(&config_path, config::strip_password(&config_text)).context("remove password from config.ini")?,
-            Err(e) => eprintln!("password not saved, left in config.ini: {e:#}"),
-        }
-    }
-
+pub fn run(ui: &mut Ui, settings: &Config, server: &Server, password: String) -> anyhow::Result<Outcome> {
+    let (w, h) = ui.fb.size();
+    let (width, height) = (w as u16, h as u16);
+    let (result, mut framed) = connect(settings, server, password, width, height)?;
     if (result.desktop_size.width, result.desktop_size.height) != (width, height) {
         bail!("server refused {width}x{height}, offered {}x{}", result.desktop_size.width, result.desktop_size.height);
     }
-    session(result, &mut framed, &fb, &mut touch, width, height, Scheduler::new(Rect { x: 0, y: 0, w: i32::from(width), h: i32::from(height) }, busy_ms, settle))
+    session(result, &mut framed, ui, width, height, Scheduler::new(Rect { x: 0, y: 0, w, h }))
 }
 
-fn connect(cfg: &Config, password: String, width: u16, height: u16) -> anyhow::Result<(ConnectionResult, Framed)> {
+fn connect(settings: &Config, cfg: &Server, password: String, width: u16, height: u16) -> anyhow::Result<(ConnectionResult, Framed)> {
     use std::net::ToSocketAddrs as _;
     let rdp_config = connector::Config {
         credentials: Credentials::UsernamePassword { username: cfg.user.clone(), password },
-        domain: cfg.domain.clone(),
+        domain: Some(cfg.domain.clone()).filter(|d| !d.is_empty()),
         enable_tls: false,
         enable_credssp: true, // NLA: what Windows requires by default
         keyboard_type: KeyboardType::IbmEnhanced,
@@ -114,7 +88,7 @@ fn connect(cfg: &Config, password: String, width: u16, height: u16) -> anyhow::R
             | PerformanceFlags::DISABLE_MENUANIMATIONS
             | PerformanceFlags::DISABLE_THEMING
             | PerformanceFlags::DISABLE_CURSOR_SHADOW,
-        desktop_scale_factor: cfg.scale,
+        desktop_scale_factor: settings.scale,
         hardware_id: None,
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
@@ -128,7 +102,10 @@ fn connect(cfg: &Config, password: String, width: u16, height: u16) -> anyhow::R
     let client_addr = tcp.local_addr()?;
 
     let mut framed = ironrdp_blocking::Framed::new(tcp);
-    let mut connector = connector::ClientConnector::new(rdp_config, client_addr);
+    // Real touch input: Windows then does scrolling, right-click, drag and its touch keyboard itself.
+    let touch_channel = RdpeiClient::new(MAX_CONTACTS, CsReadyFlags::empty(), RdpInputProtocolVersion::V200);
+    let mut connector = connector::ClientConnector::new(rdp_config, client_addr)
+        .with_static_channel(DrdynvcClient::new().with_dynamic_channel(touch_channel));
     let should_upgrade = ironrdp_blocking::connect_begin(&mut framed, &mut connector).context("begin connection")?;
     let (tls, server_public_key) = tls_upgrade(framed.into_inner_no_leftover(), cfg).context("TLS")?;
     let upgraded = ironrdp_blocking::mark_as_upgraded(should_upgrade, &mut connector);
@@ -155,7 +132,7 @@ impl sspi::network_client::NetworkClient for NoKerberos {
     }
 }
 
-fn tls_upgrade(tcp: TcpStream, cfg: &Config) -> anyhow::Result<(rustls::StreamOwned<rustls::ClientConnection, TcpStream>, Vec<u8>)> {
+fn tls_upgrade(tcp: TcpStream, cfg: &Server) -> anyhow::Result<(rustls::StreamOwned<rustls::ClientConnection, TcpStream>, Vec<u8>)> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()?
@@ -244,7 +221,30 @@ fn send(framed: &mut Framed, frame: &[u8]) -> anyhow::Result<()> {
     sent.context("send")
 }
 
-fn session(result: ConnectionResult, framed: &mut Framed, fb: &Fb, touch: &mut TouchScreen, width: u16, height: u16, mut scheduler: Scheduler) -> anyhow::Result<()> {
+
+/// IronRDP's own error types are not all `Send + Sync`: keep their text.
+fn text<E: std::fmt::Display>(e: E) -> anyhow::Error {
+    anyhow!("{e}")
+}
+
+fn send_outputs(framed: &mut Framed, outputs: Vec<ActiveStageOutput>) -> anyhow::Result<()> {
+    for out in outputs {
+        if let ActiveStageOutput::ResponseFrame(frame) = out {
+            send(framed, &frame)?;
+        }
+    }
+    Ok(())
+}
+
+/// True when Windows accepted the touch channel and wants input on it right now.
+fn touch_channel_ready(stage: &mut ActiveStage) -> bool {
+    stage
+        .get_dvc::<RdpeiClient>()
+        .and_then(|channel| channel.channel_processor_downcast_ref::<RdpeiClient>())
+        .is_some_and(|client| client.ready() && !client.is_suspended())
+}
+
+fn session(result: ConnectionResult, framed: &mut Framed, ui: &mut Ui, width: u16, height: u16, mut scheduler: Scheduler) -> anyhow::Result<Outcome> {
     let activation = result.activation_factory;
     let mut stage: ActiveStage = ActiveStageBuilder {
         static_channels: result.static_channels,
@@ -260,54 +260,115 @@ fn session(result: ConnectionResult, framed: &mut Framed, fb: &Fb, touch: &mut T
 
     let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
     let screen = Rect { x: 0, y: 0, w: i32::from(width), h: i32::from(height) };
-    let mut gestures = Gestures::new(screen.w);
+    let mut contacts = TouchFrameBuilder::new(MAX_CONTACTS);
+    let mut router = TouchRouter::default();
+    let mut last_contact_frame = 0;
+    let mut mouse = Gestures::new();
     let mut input = Database::new();
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
 
     let socket = framed.get_inner().0.sock.as_raw_fd();
     framed.get_inner().0.sock.set_nonblocking(true)?;
-    let (mut touches, mut actions) = (Vec::new(), Vec::new());
+    let (mut touches, mut actions, mut routed) = (Vec::new(), Vec::new(), Vec::new());
 
     loop {
         for (rect, wave) in scheduler.tick(now()) {
-            fb.refresh(rect, wave);
+            ui.fb.refresh(rect, wave);
         }
-        let [net_ready, touch_ready] = device::poll([socket, touch.fd()], scheduler.wait(now()))?;
+        let touch_channel = touch_channel_ready(&mut stage);
+        let keepalive = (touch_channel && router.held().next().is_some()).then(|| last_contact_frame + KEEPALIVE_MS);
+        let wake = [keepalive, router.hold_deadline()].into_iter().flatten().map(|at| at.saturating_sub(now()));
+        let timeout = scheduler.wait(now()).into_iter().chain(wake).min();
+        let [net_ready, touch_ready] = device::poll([socket, ui.touch.fd()], timeout)?;
+        let now_us = start.elapsed().as_micros() as u64;
 
         if touch_ready {
-            touch.read(&mut touches)?;
-            for t in touches.drain(..) {
-                gestures.feed(t, now(), &mut actions);
+            ui.touch.read(ui.fb.rotation, &mut touches)?;
+            for touch in touches.drain(..) {
+                router.feed(touch, now(), &mut routed);
+                if !touch_channel {
+                    mouse.feed(touch, now(), &mut actions);
+                }
             }
-            let mut ops = Vec::new();
-            for action in actions.drain(..) {
-                match action {
-                    Action::Move(x, y) => ops.push(Operation::MouseMove(MousePosition {
-                        x: x.clamp(0, screen.w - 1) as u16,
-                        y: y.clamp(0, screen.h - 1) as u16,
-                    })),
-                    Action::Left(true) => ops.push(Operation::MouseButtonPressed(MouseButton::Left)),
-                    Action::Left(false) => ops.push(Operation::MouseButtonReleased(MouseButton::Left)),
-                    Action::Right(true) => ops.push(Operation::MouseButtonPressed(MouseButton::Right)),
-                    Action::Right(false) => ops.push(Operation::MouseButtonReleased(MouseButton::Right)),
-                    Action::Wheel(n) => ops.push(Operation::WheelRotations(WheelRotations { is_vertical: true, rotation_units: (n * 120) as i16 })),
-                    Action::FullRefresh => scheduler.request_full(),
-                    Action::Exit => {
-                        for out in stage.graceful_shutdown()? {
-                            if let ActiveStageOutput::ResponseFrame(frame) = out {
-                                send(framed, &frame)?;
-                            }
-                        }
-                        return Ok(());
+            for route in routed.drain(..) {
+                match route {
+                    Routed::Contact { .. } if !touch_channel => {} // mouse emulation handles the fingers
+                    Routed::Contact { slot, phase, x, y } => {
+                        let phase = match phase {
+                            Phase::Start => TouchPhase::Started,
+                            Phase::Move => TouchPhase::Moved,
+                            Phase::End => TouchPhase::Ended,
+                            Phase::Cancel => TouchPhase::Canceled,
+                        };
+                        contacts.push(slot as u64, phase, x.clamp(0, screen.w - 1), y.clamp(0, screen.h - 1), None, now_us);
                     }
+                    Routed::RightClick { x, y } => actions.extend([Action::Move(x, y), Action::Right(true), Action::Right(false)]),
                 }
             }
-            let events = input.apply(ops);
-            for out in stage.process_fastpath_input(&mut image, &events)? {
-                if let ActiveStageOutput::ResponseFrame(frame) = out {
-                    send(framed, &frame)?;
-                }
+        }
+
+        // Two fingers resting open the local menu. Take everything back from Windows first.
+        let menu = router.take_hold(now());
+        if menu {
+            actions.clear();
+            contacts.cancel_all(now_us);
+            mouse = Gestures::new();
+            let released = input.release_all();
+            send_outputs(framed, stage.process_fastpath_input(&mut image, &released)?)?;
+        }
+
+        if !touch_channel {
+            contacts.reset();
+        } else if !contacts.has_pending_frames() && now() >= last_contact_frame + KEEPALIVE_MS {
+            // The panel reports nothing while a finger rests, and Windows drops a contact that
+            // gets no updates: restate resting fingers so press-and-hold (right click) completes.
+            for (slot, x, y) in router.held() {
+                contacts.push(slot as u64, TouchPhase::Moved, x.clamp(0, screen.w - 1), y.clamp(0, screen.h - 1), None, now_us);
+            }
+        }
+        if let Some(event) = contacts.take_event(now_us) {
+            let messages = {
+                let channel = stage.get_dvc::<RdpeiClient>().context("touch channel closed")?;
+                let id = channel.channel_id().context("touch channel closed")?;
+                let client = channel.channel_processor_downcast_ref::<RdpeiClient>().context("touch channel closed")?;
+                client.encode_touch_event(id, event).map_err(text)?
+            };
+            let frame = stage.encode_dvc_messages(messages)?;
+            send(framed, &frame)?;
+            last_contact_frame = now();
+        }
+
+        let mut ops = Vec::new();
+        for action in actions.drain(..) {
+            ops.push(match action {
+                Action::Move(x, y) => Operation::MouseMove(MousePosition { x: x.clamp(0, screen.w - 1) as u16, y: y.clamp(0, screen.h - 1) as u16 }),
+                Action::Left(true) => Operation::MouseButtonPressed(MouseButton::Left),
+                Action::Left(false) => Operation::MouseButtonReleased(MouseButton::Left),
+                Action::Right(true) => Operation::MouseButtonPressed(MouseButton::Right),
+                Action::Right(false) => Operation::MouseButtonReleased(MouseButton::Right),
+                Action::Wheel(n) => Operation::WheelRotations(WheelRotations { is_vertical: true, rotation_units: (n * 120) as i16 }),
+            });
+        }
+        let events = input.apply(ops);
+        send_outputs(framed, stage.process_fastpath_input(&mut image, &events)?)?;
+
+        if menu {
+            let choice = ui.dialog("KindleRDP", &["Keyboard", "Disconnect", "Rotate screen", "Back to Windows"])?;
+            if choice == 1 || choice == 2 {
+                send_outputs(framed, stage.graceful_shutdown()?)?;
+                return Ok(if choice == 1 { Outcome::Disconnected } else { Outcome::Rotate });
+            }
+            // The menu overwrote the session picture: put it back, with a cleaning flash.
+            ui.forget();
+            ui.fb.blit(image.data(), usize::from(width), screen);
+            scheduler.request_full();
+            if choice == 0 {
+                // Win+Ctrl+O toggles Windows' On-Screen Keyboard. It needs no Windows setting.
+                let keys = [Scancode::from_u8(true, 0x5B), Scancode::from_u8(false, 0x1D), Scancode::from_u8(false, 0x18)];
+                let chord = keys.map(Operation::KeyPressed).into_iter().chain(keys.into_iter().rev().map(Operation::KeyReleased));
+                let events = input.apply(chord);
+                send_outputs(framed, stage.process_fastpath_input(&mut image, &events)?)?;
             }
         }
 
@@ -328,12 +389,12 @@ fn session(result: ConnectionResult, framed: &mut Framed, fb: &Fb, touch: &mut T
                             w: i32::from(r.right) - i32::from(r.left) + 1,
                             h: i32::from(r.bottom) - i32::from(r.top) + 1,
                         };
-                        fb.blit(image.data(), usize::from(width), rect);
+                        ui.fb.blit(image.data(), usize::from(width), rect);
                         scheduler.damage(rect, now());
                     }
                     ActiveStageOutput::Terminate(reason) => {
                         eprintln!("server closed the session: {reason}");
-                        return Ok(());
+                        return Ok(Outcome::Disconnected);
                     }
                     ActiveStageOutput::DeactivateAll => {
                         // Windows does this when it attaches us to an existing session.

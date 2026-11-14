@@ -1,4 +1,4 @@
-//! Kindle hardware: framebuffer, e-ink refresh through the fbink tool, touch screen, state files.
+//! Kindle hardware: framebuffer, e-ink refresh, touch screen, state files.
 
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use anyhow::{Context as _, bail};
 
 use crate::gesture::{MtParser, Touch};
-use crate::rects::{Rect, Wave};
+use crate::rects::{Rect, Rotation, Wave};
 
 /// Root-only ext partition: survives reboots and is not exposed over USB.
 pub const STATE_DIR: &str = "/var/local/kindlerdp";
@@ -38,7 +38,8 @@ fn fbink(args: &[&str]) {
     }
 }
 
-/// Show a line of text in the middle of the screen.
+/// Show a line of text in the middle of the screen. Only for errors before the app's own
+/// screens can draw.
 pub fn message(text: &str) {
     eprintln!("{text}");
     fbink(&["-pmM", text]);
@@ -90,27 +91,12 @@ struct FixInfo {
     reserved: [u16; 2],
 }
 
-/// Waveform by name: (driver id, ms one update keeps its area busy, limited to black/white-ish).
-/// Ids are MTK_WAVEFORM_MODE_* from the Kindle kernel's hwtcon_ioctl_cmd.h.
-pub fn waveform(name: &str) -> Option<(u32, u64, bool)> {
-    Some(match name {
-        "A2" => (6, 120, true),
-        "DU" => (1, 260, true),
-        "DU4" => (7, 290, true),
-        "GL16" => (3, 450, false),
-        "REAGL" => (4, 450, false),
-        "GC16" => (2, 450, false),
-        "AUTO" => (257, 450, false),
-        _ => return None,
-    })
-}
-
 /// MXCFB_SEND_UPDATE_MTK: _IOW('F', 0x2E, struct mxcfb_update_data_mtk), 24 u32 fields.
 const SEND_UPDATE: u32 = (1 << 30) | (96 << 16) | ((b'F' as u32) << 8) | 0x2E;
 const TEMP_USE_AMBIENT: u32 = 0x1000;
 
-/// The panel, driven in landscape: session (x, y) maps to framebuffer (fb_w - 1 - y, x).
-// shortcut: fixed 90° rotation and 8-bit gray only; add a config key and 32bpp for other models.
+/// The panel. Callers work in session coordinates; `rotation` maps them to the framebuffer.
+// shortcut: 8-bit gray panels only; add 32bpp for color models.
 pub struct Fb {
     file: File,
     map: *mut u8,
@@ -118,8 +104,7 @@ pub struct Fb {
     fb_w: i32,
     fb_h: i32,
     stride: usize,
-    fast: String,
-    fast_id: u32,
+    pub rotation: Rotation,
     gamma: [u8; 256],
     marker: Cell<u32>,
     /// Set after the direct ioctl failed once (not an MTK panel): use the fbink tool from then on.
@@ -127,9 +112,11 @@ pub struct Fb {
 }
 
 impl Fb {
-    pub fn open(fast_waveform: &str, gamma: f32) -> anyhow::Result<Self> {
-        let (fast_id, ..) = waveform(fast_waveform).with_context(|| format!("unknown fast_waveform '{fast_waveform}'"))?;
-        let gamma = std::array::from_fn(|i| ((i as f32 / 255.0).powf(gamma) * 255.0).round() as u8);
+    pub fn set_gamma(&mut self, gamma: f32) {
+        self.gamma = std::array::from_fn(|i| ((i as f32 / 255.0).powf(gamma) * 255.0).round() as u8);
+    }
+
+    pub fn open(gamma: f32, rotation: Rotation) -> anyhow::Result<Self> {
         let f = OpenOptions::new().read(true).write(true).open("/dev/fb0").context("open /dev/fb0")?;
         let mut var = [0u32; 40]; // struct fb_var_screeninfo: 0 = xres, 1 = yres, 6 = bits_per_pixel
         let mut fix = FixInfo::default();
@@ -154,58 +141,72 @@ impl Fb {
         if map == libc::MAP_FAILED {
             bail!("mmap /dev/fb0: {}", std::io::Error::last_os_error());
         }
-        Ok(Self {
+        let mut fb = Self {
             file: f,
             map: map.cast(),
             len,
             fb_w,
             fb_h,
             stride,
-            fast: fast_waveform.to_owned(),
-            fast_id,
-            gamma,
+            rotation,
+            gamma: [0; 256],
             marker: Cell::new(0),
             via_fbink: Cell::new(false),
-        })
+        };
+        fb.set_gamma(gamma);
+        Ok(fb)
     }
 
-    /// Session size: landscape, width a multiple of 4 as RDP servers expect.
-    pub fn session_size(&self) -> (u16, u16) {
-        ((self.fb_h & !3) as u16, self.fb_w as u16)
+    /// Size of the session (and of the app's screens) in the current rotation.
+    pub fn size(&self) -> (i32, i32) {
+        self.rotation.session_size(self.fb_w, self.fb_h)
     }
 
     pub fn fb_size(&self) -> (i32, i32) {
         (self.fb_w, self.fb_h)
     }
 
-    /// Copy `r` (session coordinates) from an RGBA image to the panel as gray.
-    pub fn blit(&self, rgba: &[u8], img_w: usize, r: Rect) {
+    /// Write the pixels of `r` (session coordinates); `gray(x, y)` supplies each one.
+    fn draw(&self, r: Rect, gray: impl Fn(usize, usize) -> u8) {
         // SAFETY: the mapping is `len` bytes and lives as long as self.
         let fb = unsafe { std::slice::from_raw_parts_mut(self.map, self.len) };
-        for y in r.y..r.y + r.h {
-            let col = (self.fb_w - 1 - y) as usize;
-            let row = &rgba[(y as usize * img_w + r.x as usize) * 4..][..r.w as usize * 4];
-            for (i, px) in row.chunks_exact(4).enumerate() {
-                let gray = (px[0] as u32 * 77 + px[1] as u32 * 150 + px[2] as u32 * 29) >> 8;
-                fb[(r.x as usize + i) * self.stride + col] = self.gamma[gray as usize];
+        for y in r.y as usize..(r.y + r.h) as usize {
+            for x in r.x as usize..(r.x + r.w) as usize {
+                let at = match self.rotation {
+                    Rotation::Portrait => y * self.stride + x,
+                    Rotation::Landscape => x * self.stride + self.fb_w as usize - 1 - y,
+                };
+                fb[at] = gray(x, y);
             }
         }
     }
 
+    /// Copy `r` from an RGBA image to the panel as gray, through the gamma curve.
+    pub fn blit(&self, rgba: &[u8], img_w: usize, r: Rect) {
+        self.draw(r, |x, y| {
+            let px = &rgba[(y * img_w + x) * 4..][..3];
+            self.gamma[((px[0] as u32 * 77 + px[1] as u32 * 150 + px[2] as u32 * 29) >> 8) as usize]
+        });
+    }
+
+    /// Copy `r` from a gray image (the app's own screens).
+    pub fn blit_gray(&self, gray: &[u8], img_w: usize, r: Rect) {
+        self.draw(r, |x, y| gray[y * img_w + x]);
+    }
+
     pub fn refresh(&self, r: Rect, wave: Wave) {
-        let (top, left, width, height) = (r.x, self.fb_w - r.y - r.h, r.h, r.w);
+        let Rect { x: left, y: top, w: width, h: height } = self.rotation.to_fb(r, self.fb_w);
         if !self.via_fbink.get() {
             let (mode, full) = match wave {
-                Wave::Fast => (self.fast_id, 0),
-                Wave::Quality => (3, 0), // GL16
-                Wave::Full => (2, 1),    // GC16, flashing
+                // MTK_WAVEFORM_MODE_* from the Kindle kernel's hwtcon_ioctl_cmd.h
+                Wave::Fast => (3, 0), // GL16
+                Wave::Full => (2, 1), // GC16, flashing
+                Wave::Mono => (1, 0), // DU
             };
             self.marker.set(self.marker.get().wrapping_add(1).max(1));
             let mut update = [0u32; 24];
             update[..7].copy_from_slice(&[top as u32, left as u32, width as u32, height as u32, mode, full, self.marker.get()]);
             update[7] = TEMP_USE_AMBIENT;
-            update[20] = 1; // AUTO: DU for black/white areas
-            update[21] = 3; // AUTO: GL16 for gray areas
             // SAFETY: `update` has the size encoded in the request and outlives the call.
             if unsafe { libc::ioctl(self.file.as_raw_fd(), SEND_UPDATE as _, update.as_mut_ptr()) } == 0 {
                 return;
@@ -215,9 +216,9 @@ impl Fb {
         }
         let region = format!("top={top},left={left},width={width},height={height}");
         match wave {
-            Wave::Fast => fbink(&["-s", &region, "-W", &self.fast]),
-            Wave::Quality => fbink(&["-s", &region, "-W", "GL16"]),
+            Wave::Fast => fbink(&["-s", &region, "-W", "GL16"]),
             Wave::Full => fbink(&["-s", &region, "-W", "GC16", "-f"]),
+            Wave::Mono => fbink(&["-s", &region, "-W", "DU"]),
         }
     }
 }
@@ -276,8 +277,8 @@ impl TouchScreen {
         self.file.as_raw_fd()
     }
 
-    /// Read what is available; positions come out in session coordinates.
-    pub fn read(&mut self, out: &mut Vec<Touch>) -> anyhow::Result<()> {
+    /// Read what is available; positions come out in session coordinates for `rotation`.
+    pub fn read(&mut self, rotation: Rotation, out: &mut Vec<Touch>) -> anyhow::Result<()> {
         // struct input_event: two kernel longs of timestamp, then type, code, value.
         const TIME: usize = 2 * size_of::<libc::c_ulong>();
         let mut buf = [0u8; (TIME + 8) * 32];
@@ -290,18 +291,18 @@ impl TouchScreen {
             let value = i32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
             self.parser.feed(kind, code, value, &mut raw);
         }
-        let rotate = |x: i32, y: i32| {
+        let place = |x: i32, y: i32| {
             let fx = (x as i64 * self.fb_w as i64 / (self.max_x as i64 + 1)) as i32;
             let fy = (y as i64 * self.fb_h as i64 / (self.max_y as i64 + 1)) as i32;
-            (fy, self.fb_w - 1 - fx)
+            rotation.point_from_fb(fx, fy, self.fb_w)
         };
         out.extend(raw.into_iter().map(|t| match t {
             Touch::Down { slot, x, y } => {
-                let (x, y) = rotate(x, y);
+                let (x, y) = place(x, y);
                 Touch::Down { slot, x, y }
             }
             Touch::Move { slot, x, y } => {
-                let (x, y) = rotate(x, y);
+                let (x, y) = place(x, y);
                 Touch::Move { slot, x, y }
             }
             up => up,
@@ -311,6 +312,7 @@ impl TouchScreen {
 }
 
 /// Wait until one of the fds is readable or the timeout passes. Returns per-fd readiness.
+/// A negative fd is ignored.
 pub fn poll(fds: [RawFd; 2], timeout_ms: Option<u64>) -> anyhow::Result<[bool; 2]> {
     let mut p = fds.map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
     let timeout = timeout_ms.map_or(-1, |t| t.min(60_000) as libc::c_int);
