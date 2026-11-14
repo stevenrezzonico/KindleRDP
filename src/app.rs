@@ -135,12 +135,9 @@ fn run() -> anyhow::Result<()> {
     let touch = TouchScreen::open(fb_w, fb_h)?;
 
     let servers_path = dir.join("servers.ini");
-    let mut app = App { ui: Ui { fb, touch, shown: None, whole: Wave::Full }, settings, servers: Vec::new(), servers_path, config_path: config_path.clone(), serial: device::serial() };
-    match std::fs::read_to_string(&app.servers_path) {
-        Ok(text) => app.servers = servers::parse(&text).map_err(anyhow::Error::msg)?,
-        Err(_) => app.import_first_version(&config_path, &config_text)?,
-    }
-    app.list()
+    // No servers.ini yet: an empty list.
+    let servers = servers::parse(&std::fs::read_to_string(&servers_path).unwrap_or_default()).map_err(anyhow::Error::msg)?;
+    App { ui: Ui { fb, touch, shown: None, whole: Wave::Full }, settings, servers, servers_path, config_path, serial: device::serial() }.list()
 }
 
 impl App {
@@ -158,28 +155,18 @@ impl App {
     }
 
     fn save_servers(&self) -> anyhow::Result<()> {
-        std::fs::write(&self.servers_path, servers::serialize(&self.servers)).context("write servers.ini")
+        // Written beside the list and renamed over it: a write cut short never leaves half a file.
+        let tmp = self.servers_path.with_extension("ini.tmp");
+        std::fs::write(&tmp, servers::serialize(&self.servers)).context("write servers.ini")?;
+        std::fs::rename(&tmp, &self.servers_path).context("write servers.ini")
     }
 
-    /// The first version had one server in config.ini and one password file: carry both over.
-    fn import_first_version(&mut self, config_path: &std::path::Path, config_text: &str) -> anyhow::Result<()> {
-        let old = &self.settings;
-        if old.host.is_empty() || old.user.is_empty() {
-            return Ok(());
+    /// Remove the saved password of a server that is gone from the list, unless another
+    /// server uses the same account and so the same file.
+    fn forget_password(&self, gone: &Server) {
+        if !self.servers.iter().any(|s| s.account() == gone.account()) {
+            let _ = std::fs::remove_file(Self::cred_path(gone));
         }
-        let server = Server { name: old.host.clone(), host: old.host.clone(), port: old.port, user: old.user.clone(), domain: old.domain.clone().unwrap_or_default(), scale: None };
-        let password = old
-            .password
-            .clone()
-            .or_else(|| cred::open(&self.serial, &server.account(), &std::fs::read(device::state("cred")).ok()?));
-        if let Some(password) = password {
-            self.save_password(&server, &password)?;
-        }
-        if old.password.is_some() {
-            std::fs::write(config_path, config::strip_password(config_text)).context("remove password from config.ini")?;
-        }
-        self.servers.push(server);
-        self.save_servers()
     }
 
     fn list(&mut self) -> anyhow::Result<()> {
@@ -248,7 +235,7 @@ impl App {
                     let question = format!("Delete {}?", self.servers[index].name);
                     if self.ui.dialog(&question, &["Delete", "Keep"])? == 0 {
                         let removed = self.servers.remove(index);
-                        let _ = std::fs::remove_file(Self::cred_path(&removed));
+                        self.forget_password(&removed);
                         return self.save_servers();
                     }
                     self.ui.forget();
@@ -268,12 +255,12 @@ impl App {
         if !password.is_empty() {
             self.save_password(&server, password)?;
         }
-        if let Some(old) = old.filter(|_| !same_account) {
-            let _ = std::fs::remove_file(Self::cred_path(&old));
-        }
         match index {
             Some(i) => self.servers[i] = server,
             None => self.servers.push(server),
+        }
+        if let Some(old) = old {
+            self.forget_password(&old);
         }
         self.save_servers()
     }
@@ -297,6 +284,17 @@ impl App {
                 }
                 Err(e) => {
                     eprintln!("{}: {e:#}", server.name);
+                    if let Some(changed) = e.downcast_ref::<rdp::CertChanged>() {
+                        let question = format!(
+                            "The certificate of {} changed. Windows renews it about twice a year; it also changes when the PC is reinstalled. Trust the new one?",
+                            server.name
+                        );
+                        if self.ui.dialog(&question, &["Trust", "Cancel"])? == 0 {
+                            rdp::save_pin(&changed.host, &changed.fingerprint)?;
+                            continue;
+                        }
+                        return Ok(());
+                    }
                     self.ui.dialog(&format!("{}: {e:#}", server.name), &["OK"])?;
                     return Ok(());
                 }

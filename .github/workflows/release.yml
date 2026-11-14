@@ -19,9 +19,10 @@ jobs:
   release:
     runs-on: windows-latest # the build that is tested by hand is the Windows one (package.ps1)
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to commits: this job can write releases, and a version tag can be moved.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.1
 

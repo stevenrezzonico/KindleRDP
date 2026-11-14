@@ -49,7 +49,7 @@ If something fails, the reason is shown on screen and written to `kindlerdp/log.
 ## Passwords and security
 
 - Passwords are stored encrypted in `/var/local/kindlerdp`, which is not visible over USB. The key is derived from the device serial, so the files are useless on another device. Anyone with root access to the Kindle can still recover them: use a Windows account with limited rights.
-- The server's certificate is remembered on first connection. If it later changes, KindleRDP refuses to connect and names the file to edit.
+- The server's certificate is remembered on first connection. If it later changes (Windows renews it about twice a year), KindleRDP stops before sending the password and asks whether to trust the new one.
 
 ## Build
 

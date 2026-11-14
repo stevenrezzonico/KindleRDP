@@ -37,6 +37,8 @@ type Framed = ironrdp_blocking::Framed<rustls::StreamOwned<rustls::ClientConnect
 const MAX_CONTACTS: u16 = 5;
 /// How often resting fingers are restated to Windows.
 const KEEPALIVE_MS: u64 = 100;
+/// Longest stretch of reading the socket before the screen and touches get their turn.
+const DRAIN_MS: u64 = 50;
 
 /// Why a session ended without an error.
 pub enum Outcome {
@@ -100,6 +102,10 @@ fn connect(scale: u32, cfg: &Server, password: String, width: u16, height: u16) 
     let addr = (cfg.host.as_str(), cfg.port).to_socket_addrs().context("resolve host")?.next().context("host has no address")?;
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).context("TCP connect")?;
     tcp.set_nodelay(true)?;
+    // Without these a server that goes silent during login hangs the app, and the Kindle with it.
+    // The session reads without blocking, so they only bound the login and each send.
+    tcp.set_read_timeout(Some(Duration::from_secs(20)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(20)))?;
     let client_addr = tcp.local_addr()?;
 
     let mut framed = ironrdp_blocking::Framed::new(tcp);
@@ -150,17 +156,13 @@ fn tls_upgrade(tcp: TcpStream, cfg: &Server) -> anyhow::Result<(rustls::StreamOw
 
     // Windows RDP certificates are self-signed, so trust is by first use: the certificate seen
     // on the first connection is the only one accepted later. Checked before any credential is sent.
-    let pins_path = device::state("pins");
-    let known = std::fs::read_to_string(&pins_path).unwrap_or_default();
+    let known = std::fs::read_to_string(device::state("pins")).unwrap_or_default();
     let host = format!("{}:{}", cfg.host, cfg.port);
     let fingerprint = cred::sha256_hex(cert);
     match cred::check_pin(&known, &host, &fingerprint) {
         Pin::Match => {}
-        Pin::New => device::write_private(&pins_path, format!("{known}{host} {fingerprint}\n").as_bytes()).context("save certificate pin")?,
-        Pin::Mismatch => bail!(
-            "certificate of {host} changed. If you reinstalled that PC, delete its line in {} and retry",
-            pins_path.display()
-        ),
+        Pin::New => save_pin(&host, &fingerprint)?,
+        Pin::Mismatch => return Err(CertChanged { host, fingerprint }.into()),
     }
 
     use x509_cert::der::Decode as _;
@@ -172,6 +174,29 @@ fn tls_upgrade(tcp: TcpStream, cfg: &Server) -> anyhow::Result<(rustls::StreamOw
         .context("bad server public key")?
         .to_owned();
     Ok((tls, server_public_key))
+}
+
+/// The server showed another certificate than the one remembered. Nothing was sent to it.
+/// The app asks the user whether to trust the new one (`save_pin`).
+#[derive(Debug)]
+pub struct CertChanged {
+    pub host: String,
+    pub fingerprint: String,
+}
+
+impl std::fmt::Display for CertChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "certificate of {} changed", self.host)
+    }
+}
+
+impl std::error::Error for CertChanged {}
+
+/// Remember `fingerprint` as the only certificate accepted for `host` ("name:port").
+pub fn save_pin(host: &str, fingerprint: &str) -> anyhow::Result<()> {
+    let path = device::state("pins");
+    let known = std::fs::read_to_string(&path).unwrap_or_default();
+    device::write_private(&path, cred::set_pin(&known, host, fingerprint).as_bytes()).context("save certificate pin")
 }
 
 /// Accepts any certificate chain (pinning happens after the handshake) but still verifies the
@@ -280,6 +305,8 @@ fn session(
     let socket = framed.get_inner().0.sock.as_raw_fd();
     framed.get_inner().0.sock.set_nonblocking(true)?;
     let (mut touches, mut actions, mut routed) = (Vec::new(), Vec::new(), Vec::new());
+    // The last pass stopped reading the socket early: more may be waiting, undetected by poll.
+    let mut backlog = false;
 
     loop {
         for (rect, wave) in scheduler.tick(now()) {
@@ -288,8 +315,9 @@ fn session(
         let touch_channel = touch_channel_ready(&mut stage);
         let keepalive = (touch_channel && router.held().next().is_some()).then(|| last_contact_frame + KEEPALIVE_MS);
         let wake = [keepalive, router.hold_deadline()].into_iter().flatten().map(|at| at.saturating_sub(now()));
-        let timeout = scheduler.wait(now()).into_iter().chain(wake).min();
-        let [net_ready, touch_ready] = device::poll([socket, ui.touch.fd()], timeout)?;
+        let timeout = if backlog { Some(0) } else { scheduler.wait(now()).into_iter().chain(wake).min() };
+        let [net_polled, touch_ready] = device::poll([socket, ui.touch.fd()], timeout)?;
+        let net_ready = net_polled || std::mem::take(&mut backlog);
         let now_us = start.elapsed().as_micros() as u64;
 
         if touch_ready {
@@ -401,7 +429,14 @@ fn session(
         }
 
         // Drain the socket: TLS may hold several decrypted frames after one readable event.
+        // Not for longer than DRAIN_MS: a server that sends faster than the Kindle decodes must
+        // not keep the screen and the touches waiting. `backlog` brings the loop straight back.
+        let drain_start = Instant::now();
         while net_ready {
+            if drain_start.elapsed() >= Duration::from_millis(DRAIN_MS) {
+                backlog = true;
+                break;
+            }
             let (action, payload) = match framed.read_pdu() {
                 Ok(pdu) => pdu,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,

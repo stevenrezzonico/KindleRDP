@@ -47,6 +47,12 @@ pub fn check_pin(known: &str, host: &str, fingerprint: &str) -> Pin {
     }
 }
 
+/// The pin file with `host` pinned to `fingerprint`, replacing any earlier pin of that host.
+pub fn set_pin(known: &str, host: &str, fingerprint: &str) -> String {
+    let others = known.lines().filter(|l| l.split_once(' ').is_none_or(|(h, _)| h != host));
+    others.map(str::to_string).chain([format!("{host} {fingerprint}")]).map(|l| l + "\n").collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +77,10 @@ mod tests {
         assert_eq!(check_pin(known, "pc:3389", "cc"), Pin::Mismatch);
         assert_eq!(check_pin(known, "new:3389", "aa"), Pin::New);
         assert_eq!(sha256_hex(b"abc").len(), 64);
+        // a renewed certificate replaces the old pin and leaves other hosts alone
+        let renewed = set_pin(known, "pc:3389", "cc");
+        assert_eq!(renewed, "nas:3389 bb\npc:3389 cc\n");
+        assert_eq!(check_pin(&renewed, "pc:3389", "cc"), Pin::Match);
+        assert_eq!(set_pin("", "pc:3389", "aa"), "pc:3389 aa\n");
     }
 }

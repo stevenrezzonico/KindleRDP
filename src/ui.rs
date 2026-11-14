@@ -155,7 +155,8 @@ pub fn list_screen(c: &mut Canvas, servers: &[Server], page: usize) -> Areas<Lis
     for (slot, (index, server)) in servers.iter().enumerate().skip(page * rows).take(rows).enumerate() {
         let y = BAR_H + slot as i32 * ROW_H;
         let edit = Rect { x: c.w - 220, y: y + 15, w: 200, h: ROW_H - 30 };
-        c.text(MARGIN, y + 14, Font::Big, &server.name, BLACK);
+        let name: String = server.name.chars().take(((edit.x - MARGIN) / 32).max(0) as usize).collect(); // stops before Edit
+        c.text(MARGIN, y + 14, Font::Big, &name, BLACK);
         c.text(MARGIN, y + 90, Font::Small, &format!("{}@{}", server.user, server.host), BLACK);
         c.fill(Rect { x: 0, y: y + ROW_H - 2, w: c.w, h: 2 }, BLACK);
         c.button(edit, "Edit", false);
