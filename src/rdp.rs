@@ -26,10 +26,11 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::app::Ui;
 use crate::cred::{self, Pin};
-use crate::device;
-use crate::gesture::{Action, Gestures, Phase, Routed, TouchRouter};
-use crate::rects::{Rect, Scheduler};
+use crate::device::{self, Fb};
+use crate::gesture::{Action, Gestures, Phase, Routed, Touch, TouchRouter};
+use crate::rects::{Rect, Scheduler, Wave};
 use crate::servers::Server;
+use crate::ui::{self, Areas, Canvas, Key, Keyboard};
 
 type Framed = ironrdp_blocking::Framed<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
 
@@ -39,6 +40,9 @@ const MAX_CONTACTS: u16 = 5;
 const KEEPALIVE_MS: u64 = 100;
 /// Longest stretch of reading the socket before the screen and touches get their turn.
 const DRAIN_MS: u64 = 50;
+/// A held Backspace, Delete or arrow key repeats after this long, then at this pace.
+const REPEAT_START_MS: u64 = 500;
+const REPEAT_MS: u64 = 100;
 
 /// Why a session ended without an error.
 pub enum Outcome {
@@ -270,6 +274,130 @@ fn touch_channel_ready(stage: &mut ActiveStage) -> bool {
         .is_some_and(|client| client.ready() && !client.is_suspended())
 }
 
+/// The app's own keyboard, drawn over the top or bottom of the session picture. Windows does
+/// not know about it: the picture under it is simply not shown.
+#[derive(Default)]
+struct Board {
+    keys: Keyboard,
+    at_top: bool,
+    areas: Areas<Key>,
+    /// What is on the panel, so that only what changes is drawn again.
+    shown: Option<Canvas>,
+    /// One bit per touch slot whose finger landed on the keyboard.
+    fingers: u8,
+    /// The finger on a key: its slot and, for a key that repeats, what it types and when next.
+    held: Option<(usize, Option<((Key, u8), u64)>)>,
+}
+
+impl Board {
+    fn area(&self, screen: Rect) -> Rect {
+        let h = (screen.h * 9 / 20 / 6).min(110) * 6;
+        Rect { y: if self.at_top { 0 } else { screen.h - h }, h, ..screen }
+    }
+
+    /// The part of the screen left to the session picture.
+    fn view(board: &Option<Board>, screen: Rect) -> Rect {
+        let Some(board) = board else { return screen };
+        let area = board.area(screen);
+        Rect { y: if board.at_top { area.h } else { 0 }, h: screen.h - area.h, ..screen }
+    }
+
+    /// Put the keyboard into the framebuffer; returns the part that changed, to refresh.
+    fn paint(&mut self, fb: &Fb, screen: Rect) -> Option<Rect> {
+        let mut canvas = Canvas::new(screen.w, screen.h);
+        let area = self.area(screen);
+        self.areas = ui::keyboard(&mut canvas, area, &self.keys, true);
+        let changed = match &self.shown {
+            Some(old) => canvas.diff(old),
+            None => Some(area),
+        };
+        if let Some(r) = changed {
+            fb.blit_gray(&canvas.buf, screen.w as usize, r);
+        }
+        self.shown = Some(canvas);
+        changed
+    }
+
+    /// Take a touch that belongs to the keyboard; false leaves it to Windows. A key acts when
+    /// the finger lands, so typing does not wait for the screen.
+    fn touch(&mut self, touch: Touch, screen: Rect, now: u64, typed: &mut Vec<(Key, u8)>) -> bool {
+        match touch {
+            Touch::Down { slot, x, y } if self.area(screen).contains(x, y) => {
+                self.fingers |= 1 << slot;
+                if let Some(key) = ui::hit(&self.areas, x, y) {
+                    let out = self.keys.press(key);
+                    self.keys.pressed = Some(key);
+                    self.held = Some((slot, out.filter(|(key, _)| key.repeats()).map(|out| (out, now + REPEAT_START_MS))));
+                    typed.extend(out);
+                }
+                true
+            }
+            Touch::Down { .. } => false,
+            Touch::Move { slot, .. } => self.fingers & (1 << slot) != 0,
+            Touch::Up { slot } => {
+                let mine = self.fingers & (1 << slot) != 0;
+                self.fingers &= !(1 << slot);
+                if self.held.is_some_and(|(held, _)| held == slot) {
+                    self.release();
+                }
+                mine
+            }
+        }
+    }
+
+    fn release(&mut self) {
+        self.held = None;
+        self.keys.pressed = None;
+    }
+
+    fn repeat_at(&self) -> Option<u64> {
+        self.held?.1.map(|(_, at)| at)
+    }
+
+    fn repeat(&mut self, now: u64, typed: &mut Vec<(Key, u8)>) {
+        if let Some((_, Some((out, at)))) = &mut self.held {
+            if now >= *at {
+                typed.push(*out);
+                *at = now + REPEAT_MS;
+            }
+        }
+    }
+}
+
+/// The key events for one typed key. A character goes as Unicode, right on any Windows
+/// keyboard layout. With Ctrl, Alt or Win it must be a real key instead.
+/// shortcut: that key is taken by US position, so Ctrl+Z and Ctrl+Y swap on a QWERTZ
+/// layout (and A/Q, Z/W on AZERTY); add a layout table when that matters.
+fn key_ops(key: Key, mut mods: u8, ops: &mut Vec<Operation>) {
+    let code = Scancode::from_u8;
+    let scancode = match key {
+        Key::Char(ch) => match ui::us_scancode(ch.to_ascii_lowercase()).filter(|_| mods & (ui::CTRL | ui::ALT | ui::WIN) != 0) {
+            Some(at) => {
+                if ch.is_ascii_uppercase() {
+                    mods |= ui::SHIFT;
+                }
+                code(false, at)
+            }
+            None => return ops.extend([Operation::UnicodeKeyPressed(ch), Operation::UnicodeKeyReleased(ch)]),
+        },
+        Key::Esc => code(false, 0x01),
+        Key::Backspace => code(false, 0x0E),
+        Key::Tab => code(false, 0x0F),
+        Key::Enter => code(false, 0x1C),
+        Key::Up => code(true, 0x48),
+        Key::Left => code(true, 0x4B),
+        Key::Right => code(true, 0x4D),
+        Key::Down => code(true, 0x50),
+        Key::Delete => code(true, 0x53),
+        _ => return,
+    };
+    let all = [(ui::CTRL, code(false, 0x1D)), (ui::ALT, code(false, 0x38)), (ui::WIN, code(true, 0x5B)), (ui::SHIFT, code(false, 0x2A))];
+    let held: Vec<Scancode> = all.into_iter().filter(|(bit, _)| mods & bit != 0).map(|(_, code)| code).collect();
+    ops.extend(held.iter().copied().map(Operation::KeyPressed));
+    ops.extend([Operation::KeyPressed(scancode), Operation::KeyReleased(scancode)]);
+    ops.extend(held.into_iter().rev().map(Operation::KeyReleased));
+}
+
 fn session(
     result: ConnectionResult,
     framed: &mut Framed,
@@ -307,6 +435,7 @@ fn session(
     let (mut touches, mut actions, mut routed) = (Vec::new(), Vec::new(), Vec::new());
     // The last pass stopped reading the socket early: more may be waiting, undetected by poll.
     let mut backlog = false;
+    let mut board: Option<Board> = None;
 
     loop {
         for (rect, wave) in scheduler.tick(now()) {
@@ -314,15 +443,23 @@ fn session(
         }
         let touch_channel = touch_channel_ready(&mut stage);
         let keepalive = (touch_channel && router.held().next().is_some()).then(|| last_contact_frame + KEEPALIVE_MS);
-        let wake = [keepalive, router.hold_deadline()].into_iter().flatten().map(|at| at.saturating_sub(now()));
+        let repeat = board.as_ref().and_then(Board::repeat_at);
+        let wake = [keepalive, router.hold_deadline(), repeat].into_iter().flatten().map(|at| at.saturating_sub(now()));
         let timeout = if backlog { Some(0) } else { scheduler.wait(now()).into_iter().chain(wake).min() };
         let [net_polled, touch_ready] = device::poll([socket, ui.touch.fd()], timeout)?;
         let net_ready = net_polled || std::mem::take(&mut backlog);
         let now_us = start.elapsed().as_micros() as u64;
 
+        let mut ops = Vec::new();
+        let mut typed = Vec::new();
+        let mut repaint = false;
         if touch_ready {
             ui.touch.read(ui.fb.rotation, &mut touches)?;
             for touch in touches.drain(..) {
+                if board.as_mut().is_some_and(|b| b.touch(touch, screen, now(), &mut typed)) {
+                    repaint = true;
+                    continue;
+                }
                 router.feed(touch, now(), &mut routed);
                 if !touch_channel {
                     mouse.feed(touch, now(), &mut actions);
@@ -345,12 +482,45 @@ fn session(
             }
         }
 
+        if let Some(b) = &mut board {
+            b.repeat(now(), &mut typed);
+        }
+        for (key, mods) in typed {
+            // Hide and Move give the covered picture back to the session.
+            let uncovered = match key {
+                Key::Hide => board.take().map(|b| b.area(screen)),
+                Key::Move => board.as_mut().map(|b| {
+                    let old = b.area(screen);
+                    b.at_top = !b.at_top;
+                    b.shown = None;
+                    old
+                }),
+                _ => {
+                    key_ops(key, mods, &mut ops);
+                    None
+                }
+            };
+            if let Some(r) = uncovered {
+                ui.fb.blit(image.data(), usize::from(width), r);
+                scheduler.damage(r, now());
+            }
+        }
+        if let Some(b) = board.as_mut().filter(|_| repaint) {
+            if let Some(r) = b.paint(&ui.fb, screen) {
+                ui.fb.refresh(r, Wave::Mono);
+            }
+        }
+
         // Two fingers resting open the local menu. Take everything back from Windows first.
         let menu = router.take_hold(now());
         if menu {
             actions.clear();
             contacts.cancel_all(now_us);
             mouse = Gestures::new();
+            if let Some(b) = &mut board {
+                b.release();
+                b.fingers = 0;
+            }
             let released = input.release_all();
             send_outputs(framed, stage.process_fastpath_input(&mut image, &released)?)?;
         }
@@ -376,7 +546,6 @@ fn session(
             last_contact_frame = now();
         }
 
-        let mut ops = Vec::new();
         for action in actions.drain(..) {
             ops.push(match action {
                 Action::Move(x, y) => Operation::MouseMove(MousePosition { x: x.clamp(0, screen.w - 1) as u16, y: y.clamp(0, screen.h - 1) as u16 }),
@@ -415,17 +584,17 @@ fn session(
                 send_outputs(framed, stage.graceful_shutdown()?)?;
                 return Ok(outcome);
             }
+            if choice == 0 {
+                board = if board.is_some() { None } else { Some(Board::default()) };
+            }
             // The menu overwrote the session picture: put it back, with a cleaning flash.
             ui.forget();
             ui.fb.blit(image.data(), usize::from(width), screen);
-            scheduler.request_full();
-            if choice == 0 {
-                // Win+Ctrl+O toggles Windows' On-Screen Keyboard. It needs no Windows setting.
-                let keys = [Scancode::from_u8(true, 0x5B), Scancode::from_u8(false, 0x1D), Scancode::from_u8(false, 0x18)];
-                let chord = keys.map(Operation::KeyPressed).into_iter().chain(keys.into_iter().rev().map(Operation::KeyReleased));
-                let events = input.apply(chord);
-                send_outputs(framed, stage.process_fastpath_input(&mut image, &events)?)?;
+            if let Some(b) = &mut board {
+                b.shown = None;
+                b.paint(&ui.fb, screen);
             }
+            scheduler.request_full();
         }
 
         // Drain the socket: TLS may hold several decrypted frames after one readable event.
@@ -452,8 +621,11 @@ fn session(
                             w: i32::from(r.right) - i32::from(r.left) + 1,
                             h: i32::from(r.bottom) - i32::from(r.top) + 1,
                         };
-                        ui.fb.blit(image.data(), usize::from(width), rect);
-                        scheduler.damage(rect, now());
+                        // Not under the keyboard.
+                        if let Some(rect) = rect.intersect(Board::view(&board, screen)) {
+                            ui.fb.blit(image.data(), usize::from(width), rect);
+                            scheduler.damage(rect, now());
+                        }
                     }
                     ActiveStageOutput::Terminate(reason) => {
                         eprintln!("server closed the session: {reason}");

@@ -40,7 +40,19 @@ On the server list: tap **Add**, fill in host, user and password, **Save**, then
 | Two fingers moving | Pinch zoom |
 | Two fingers resting 0.7 s | KindleRDP menu |
 
-The menu offers **Keyboard** (toggles the Windows On-Screen Keyboard), **Scale** (Windows display scale for this server; reconnects), **Disconnect**, **Rotate screen** and **Back to Windows** (which also refreshes the whole screen).
+The menu offers **Keyboard** (shows or hides the keyboard, see below), **Scale** (Windows display scale for this server; reconnects), **Disconnect**, **Rotate screen** and **Back to Windows** (which also refreshes the whole screen).
+
+### Keyboard
+
+The keyboard is KindleRDP's own and covers the lower part of the Windows picture. **Move** puts it at the top when it hides what you type into; **Hide** closes it.
+
+- A key acts when the finger lands, so you can type ahead of the screen.
+- **Shift**: one tap for the next letter, two taps to lock.
+- **Ctrl**, **Alt** and **Win** stay on for the next key: tap **Ctrl**, then **c**.
+- Backspace, **Del** and the arrows repeat while held.
+- **#+=** and **àéü** switch to symbols and accented letters.
+
+Letters and symbols arrive right on any Windows keyboard layout. Shortcuts use the US key positions: on a QWERTZ layout Ctrl+Z and Ctrl+Y are swapped, on AZERTY A/Q and Z/W.
 
 **Settings** on the server list changes the default Windows display scale and the contrast. A server can have its own scale: the **Scale %** field in its editor, or **Scale** in the menu. Empty means the default. The same values live in `kindlerdp/config.ini`, which the app creates on first start.
 
@@ -79,7 +91,8 @@ rustup target add armv7-unknown-linux-musleabihf
 ## Limits
 
 - Windows hosts only; no RD Gateway, Kerberos, audio or clipboard
-- The Windows touch keyboard does not open by itself on a text field; use **Keyboard** in the menu
+- No keyboard opens by itself on a text field; use **Keyboard** in the menu
+- The keyboard has no ë, ï or å (the font lacks them) and no F1 to F12
 - An e-ink update takes about half a second: fine for desktop work, not for video
 
 ## Built with

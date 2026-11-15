@@ -174,19 +174,198 @@ pub fn list_screen(c: &mut Canvas, servers: &[Server], page: usize) -> Areas<Lis
     areas
 }
 
+/// Modifier bits that come with a typed key.
+pub const CTRL: u8 = 1;
+pub const ALT: u8 = 2;
+pub const WIN: u8 = 4;
+pub const SHIFT: u8 = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Char(char),
+    Esc,
+    Tab,
+    Left,
+    Down,
+    Up,
+    Right,
+    Delete,
+    Backspace,
+    Enter,
+    /// Ctrl, Alt or Win: stays on for the next key.
+    Mod(u8),
     Shift,
     Symbols,
-    Backspace,
+    Accents,
+    /// Session only: put the keyboard at the other end of the screen.
+    Move,
+    /// Session only: close the keyboard.
+    Hide,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Key {
+    /// Keys that repeat while held.
+    pub fn repeats(self) -> bool {
+        matches!(self, Key::Backspace | Key::Delete | Key::Left | Key::Down | Key::Up | Key::Right)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layer {
-    Lower,
-    Upper,
+    #[default]
+    Letters,
     Symbols,
+    Accents,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Shift {
+    #[default]
+    Off,
+    /// For the next key only.
+    Once,
+    Locked,
+}
+
+/// The on-screen keyboard's state, shared by the server editor and the session.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Keyboard {
+    pub layer: Layer,
+    pub shift: Shift,
+    mods: u8,
+    /// The key under a finger: drawn inverted.
+    pub pressed: Option<Key>,
+}
+
+impl Keyboard {
+    /// A key went down. Returns what to type, with its modifier bits, or None when the key
+    /// only changed the keyboard itself.
+    pub fn press(&mut self, key: Key) -> Option<(Key, u8)> {
+        let flip = |layer: Layer, to: Layer| if layer == to { Layer::Letters } else { to };
+        match key {
+            Key::Shift => {
+                self.shift = match self.shift {
+                    Shift::Off => Shift::Once,
+                    Shift::Once => Shift::Locked,
+                    Shift::Locked => Shift::Off,
+                }
+            }
+            Key::Symbols => self.layer = flip(self.layer, Layer::Symbols),
+            Key::Accents => self.layer = flip(self.layer, Layer::Accents),
+            Key::Mod(bit) => self.mods ^= bit,
+            _ => {
+                // A character is already drawn and sent in its shifted form.
+                let shift = if self.shift != Shift::Off && !matches!(key, Key::Char(_)) { SHIFT } else { 0 };
+                if self.shift == Shift::Once {
+                    self.shift = Shift::Off;
+                }
+                return Some((key, std::mem::take(&mut self.mods) | shift));
+            }
+        }
+        None
+    }
+
+    /// The four rows of character keys as shown now.
+    fn rows(&self) -> [String; 4] {
+        let rows = match self.layer {
+            Layer::Letters => ["1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm,."],
+            Layer::Symbols => ["1234567890", "!\"#$%&'()*", "+/:;<=>?@", "~[\\]^_`{|}"],
+            // The font has no ë, ï, Å, « or »: a test checks every key for a glyph.
+            Layer::Accents => ["€£§°¿¡¨´ÿœ", "àáâäãžæçèé", "êìíîñòóôö", "õøùúûüýšß"],
+        };
+        let upper = |ch: char| {
+            let mut up = ch.to_uppercase();
+            match (up.next(), up.next()) {
+                (Some(one), None) if self.shift != Shift::Off => one,
+                _ => ch, // ß has no single capital
+            }
+        };
+        rows.map(|row| row.chars().map(upper).collect())
+    }
+}
+
+/// Where `ch` sits on a US keyboard, as a scan code. Used for shortcuts such as Ctrl+C.
+pub fn us_scancode(ch: char) -> Option<u8> {
+    if ch == ' ' {
+        return Some(0x39);
+    }
+    let rows = [("1234567890-", 0x02), ("qwertyuiop", 0x10), ("asdfghjkl", 0x1E), ("zxcvbnm,.", 0x2C)];
+    rows.iter().find_map(|(row, first)| row.find(ch).map(|i| first + i as u8))
+}
+
+/// Draw the keyboard into `area`: four rows of ten keys and a row of wide keys. In a session
+/// it has a row of special keys on top, and the keys to move and hide it.
+pub fn keyboard(c: &mut Canvas, area: Rect, kb: &Keyboard, session: bool) -> Areas<Key> {
+    let key_h = area.h / if session { 6 } else { 5 };
+    // (row, first tenth, tenths wide, label, key, drawn as switched on)
+    let mut keys: Vec<(i32, i32, i32, String, Key, bool)> = Vec::new();
+    let mut row = 0;
+    if session {
+        let top = [
+            ("Esc", Key::Esc),
+            ("Tab", Key::Tab),
+            ("Ctrl", Key::Mod(CTRL)),
+            ("Alt", Key::Mod(ALT)),
+            ("Win", Key::Mod(WIN)),
+            ("<", Key::Left),
+            ("v", Key::Down),
+            ("^", Key::Up),
+            (">", Key::Right),
+            ("Del", Key::Delete),
+        ];
+        for (i, (text, key)) in top.into_iter().enumerate() {
+            keys.push((0, i as i32, 1, text.into(), key, matches!(key, Key::Mod(bit) if kb.mods & bit != 0)));
+        }
+        row = 1;
+    }
+    for (i, chars) in kb.rows().iter().enumerate() {
+        // A row of nine leaves room for Backspace at its end, or Shift at its start.
+        let nine = chars.chars().count() == 9;
+        let shift = nine && i == 3;
+        if shift {
+            let text = if kb.shift == Shift::Locked { "LOCK" } else { "Shift" };
+            keys.push((row, 0, 1, text.into(), Key::Shift, kb.shift != Shift::Off));
+        } else if nine {
+            keys.push((row, 9, 1, "<-".into(), Key::Backspace, false));
+        }
+        for (n, ch) in chars.chars().enumerate() {
+            keys.push((row, n as i32 + i32::from(shift), 1, ch.to_string(), Key::Char(ch), false));
+        }
+        row += 1;
+    }
+    let (symbols, accents) = (kb.layer == Layer::Symbols, kb.layer == Layer::Accents);
+    let bottom: &[(i32, &str, Key, bool)] = if session {
+        &[
+            (1, "#+=", Key::Symbols, symbols),
+            (1, "àéü", Key::Accents, accents),
+            (3, "space", Key::Char(' '), false),
+            (1, "-", Key::Char('-'), false),
+            (2, "Enter", Key::Enter, false),
+            (1, "Move", Key::Move, false),
+            (1, "Hide", Key::Hide, false),
+        ]
+    } else {
+        // In the editor Enter goes to the next field.
+        &[
+            (2, "#+=", Key::Symbols, symbols),
+            (2, "àéü", Key::Accents, accents),
+            (3, "space", Key::Char(' '), false),
+            (1, "-", Key::Char('-'), false),
+            (2, "Next", Key::Enter, false),
+        ]
+    };
+    let mut start = 0;
+    for (span, text, key, on) in bottom {
+        keys.push((row, start, *span, text.to_string(), *key, *on));
+        start += span;
+    }
+    keys.into_iter()
+        .map(|(row, start, span, text, key, on)| {
+            let r = Rect { x: area.x + start * area.w / 10, y: area.y + row * key_h, w: span * area.w / 10, h: key_h };
+            c.button(r, &text, on || kb.pressed == Some(key));
+            (r, key)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +385,7 @@ const PASSWORD: usize = 5;
 pub struct Form {
     pub fields: [String; 7],
     pub active: usize,
-    pub layer: Layer,
+    pub keys: Keyboard,
     /// Shown under the buttons: what is wrong, or a hint.
     pub note: String,
     /// A password is already stored: the empty field shows stars and keeps it.
@@ -223,24 +402,16 @@ impl Form {
             None => Default::default(),
         };
         let note = if saved_password { "Password is saved. Type to replace it." } else { "" };
-        Self { fields, active: if server.is_some() { PASSWORD } else { 0 }, layer: Layer::Lower, note: note.into(), saved_password }
+        Self { fields, active: if server.is_some() { PASSWORD } else { 0 }, keys: Keyboard::default(), note: note.into(), saved_password }
     }
 
     pub fn press(&mut self, key: Key) {
-        match key {
-            Key::Char(ch) => self.fields[self.active].push(ch),
-            Key::Backspace => drop(self.fields[self.active].pop()),
-            Key::Shift => self.layer = if self.layer == Layer::Upper { Layer::Lower } else { Layer::Upper },
-            Key::Symbols => self.layer = if self.layer == Layer::Symbols { Layer::Lower } else { Layer::Symbols },
+        match self.keys.press(key) {
+            Some((Key::Char(ch), _)) => self.fields[self.active].push(ch),
+            Some((Key::Backspace, _)) => drop(self.fields[self.active].pop()),
+            Some((Key::Enter, _)) => self.active = (self.active + 1) % FIELDS.len(),
+            _ => {}
         }
-    }
-}
-
-fn key_rows(layer: Layer) -> [&'static str; 4] {
-    match layer {
-        Layer::Lower => ["1234567890", "qwertyuiop", "asdfghjkl.", "zxcvbnm-_@"],
-        Layer::Upper => ["1234567890", "QWERTYUIOP", "ASDFGHJKL.", "ZXCVBNM-_@"],
-        Layer::Symbols => ["!\"#$%&'()*", "+,-./:;<=>", "?@[\\]^_`{|", "}~"],
     }
 }
 
@@ -282,28 +453,11 @@ pub fn form_screen(c: &mut Canvas, form: &Form, can_delete: bool) -> Areas<FormH
         areas.push((Rect { x: 0, y, w: c.w, h: FIELD_H }, FormHit::Field(i)));
     }
 
-    // Keyboard: four rows of ten keys and one row of wide keys, filling the bottom.
+    // The keyboard fills the bottom.
     let top = fields_y + FIELDS.len() as i32 * FIELD_H + 8;
     let key_h = ((c.h - top) / 5).min(150);
-    let top = c.h - 5 * key_h;
-    for (row, keys) in key_rows(form.layer).iter().enumerate() {
-        for (r, ch) in row_of(top + row as i32 * key_h, key_h, c.w, 10).zip(keys.chars()) {
-            c.button(r, &ch.to_string(), false);
-            areas.push((r, FormHit::Key(Key::Char(ch))));
-        }
-    }
-    let unit = c.w / 10;
-    let wide = [
-        (0, 2, "Shift", Key::Shift, form.layer == Layer::Upper),
-        (2, 2, "#+=", Key::Symbols, form.layer == Layer::Symbols),
-        (4, 4, "space", Key::Char(' '), false),
-        (8, 2, "<-", Key::Backspace, false),
-    ];
-    for (start, span, text, key, on) in wide {
-        let r = Rect { x: start * unit, y: top + 4 * key_h, w: span * unit, h: key_h };
-        c.button(r, text, on);
-        areas.push((r, FormHit::Key(key)));
-    }
+    let area = Rect { x: 0, y: c.h - 5 * key_h, w: c.w, h: 5 * key_h };
+    areas.extend(keyboard(c, area, &form.keys, false).into_iter().map(|(r, key)| (r, FormHit::Key(key))));
     areas
 }
 
@@ -467,14 +621,91 @@ mod tests {
             form.press(Key::Shift);
             tap(&form, FormHit::Key(Key::Char('C')));
             form.press(Key::Char('C'));
+            tap(&form, FormHit::Key(Key::Char('c'))); // shift was for one letter
             form.press(Key::Symbols);
             tap(&form, FormHit::Key(Key::Char('\\')));
             form.press(Key::Char('~'));
             form.press(Key::Backspace);
             assert_eq!(form.fields[0], "pC");
             form.press(Key::Symbols);
-            assert_eq!(form.layer, Layer::Lower);
+            assert_eq!(form.keys.layer, Layer::Letters);
+            form.press(Key::Accents);
+            tap(&form, FormHit::Key(Key::Char('é')));
+            form.press(Key::Enter);
+            assert_eq!(form.active, 1);
         }
+    }
+
+    #[test]
+    fn keyboard_shift_modifiers_and_layers() {
+        let mut kb = Keyboard::default();
+        assert_eq!(kb.press(Key::Shift), None);
+        assert_eq!(kb.rows()[1], "QWERTYUIOP");
+        assert_eq!(kb.press(Key::Char('Q')), Some((Key::Char('Q'), 0)));
+        assert_eq!(kb.rows()[1], "qwertyuiop");
+        // two taps lock it; a special key then carries Shift, a character does not
+        kb.press(Key::Shift);
+        kb.press(Key::Shift);
+        assert_eq!(kb.shift, Shift::Locked);
+        assert_eq!(kb.press(Key::Left), Some((Key::Left, SHIFT)));
+        assert_eq!(kb.press(Key::Char('A')), Some((Key::Char('A'), 0)));
+        assert_eq!(kb.shift, Shift::Locked);
+        kb.press(Key::Shift);
+        // Ctrl and Alt stay on for one key
+        kb.press(Key::Mod(CTRL));
+        kb.press(Key::Mod(ALT));
+        assert_eq!(kb.press(Key::Delete), Some((Key::Delete, CTRL | ALT)));
+        assert_eq!(kb.press(Key::Char('c')), Some((Key::Char('c'), 0)));
+        kb.press(Key::Mod(WIN));
+        kb.press(Key::Mod(WIN)); // a second tap takes it back
+        assert_eq!(kb.press(Key::Tab), Some((Key::Tab, 0)));
+        // ß stays when shifted
+        kb.press(Key::Accents);
+        kb.press(Key::Shift);
+        assert!(kb.rows()[3].ends_with("ÝŠß"), "{}", kb.rows()[3]);
+        assert_eq!((us_scancode('c'), us_scancode('-'), us_scancode('.'), us_scancode(' '), us_scancode('é')), (Some(0x2E), Some(0x0C), Some(0x34), Some(0x39), None));
+    }
+
+    #[test]
+    fn session_keyboard_fits_and_every_key_has_a_glyph() {
+        for (w, h) in [(1648, 1236), (1236, 1648)] {
+            let area = Rect { x: 0, y: h - 600, w, h: 600 };
+            for layer in [Key::Shift, Key::Symbols, Key::Accents] {
+                let mut kb = Keyboard::default();
+                kb.press(layer);
+                for shifted in [false, true] {
+                    if shifted {
+                        kb.press(Key::Shift);
+                    }
+                    let mut c = Canvas::new(w, h);
+                    let areas = keyboard(&mut c, area, &kb, true);
+                    assert_eq!(areas.len(), 10 + 40 + 7, "{layer:?} {shifted}");
+                    let mut missing = String::new();
+                    for (r, key) in &areas {
+                        let (x, y) = center(*r);
+                        assert_eq!(hit(&areas, x, y), Some(*key), "{key:?} is covered at {w}x{h}");
+                        assert!(r.y >= area.y && r.y + r.h <= h && r.x >= 0 && r.x + r.w <= w, "{key:?} off the keyboard at {w}x{h}");
+                        if let Key::Char(ch) = key {
+                            let mut psf = PSF2Font::new(FONT_32X64).unwrap();
+                            if *ch != ' ' && psf.glyph_for_utf8(ch.encode_utf8(&mut [0; 4]).as_bytes()).is_none() {
+                                missing.push(*ch);
+                            }
+                        }
+                    }
+                    assert_eq!(missing, "", "keys without a glyph");
+                    assert!(c.buf[..(area.y * w) as usize].iter().all(|p| *p == 255), "drawn above the keyboard");
+                }
+            }
+        }
+        // the key under a finger is the only thing that changes
+        let (mut up, mut down) = (Canvas::new(1236, 1648), Canvas::new(1236, 1648));
+        let area = Rect { x: 0, y: 0, w: 1236, h: 660 };
+        let mut kb = Keyboard::default();
+        let areas = keyboard(&mut up, area, &kb, true);
+        kb.pressed = Some(Key::Enter);
+        keyboard(&mut down, area, &kb, true);
+        let (enter, _) = areas.iter().find(|(_, k)| *k == Key::Enter).unwrap();
+        assert_eq!(down.diff(&up).map(|d| enter.union(d)), Some(*enter));
     }
 
     #[test]

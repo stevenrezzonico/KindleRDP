@@ -17,6 +17,13 @@ impl Rect {
         Rect { x, y, w: r - x, h: b - y }
     }
 
+    /// The part of `self` inside `o`, if any.
+    pub fn intersect(self, o: Rect) -> Option<Rect> {
+        let (x, y) = (self.x.max(o.x), self.y.max(o.y));
+        let (r, b) = ((self.x + self.w).min(o.x + o.w), (self.y + self.h).min(o.y + o.h));
+        (x < r && y < b).then(|| Rect { x, y, w: r - x, h: b - y })
+    }
+
     pub fn contains(self, x: i32, y: i32) -> bool {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
@@ -228,6 +235,8 @@ mod tests {
         assert_eq!(l.len(), 2);
         add(&mut l, r(0, 0, 0, 5)); // empty: ignored
         assert_eq!(l.len(), 2);
+        assert_eq!(r(0, 0, 10, 10).intersect(r(5, 8, 10, 10)), Some(r(5, 8, 5, 2)));
+        assert_eq!(r(0, 0, 10, 10).intersect(r(10, 0, 5, 5)), None);
     }
 
     #[test]
