@@ -1,3 +1,3 @@
 #!/bin/sh
 # C compiler for the Kindle target (Linux build hosts). Same flags as zigcc.cmd.
-exec zig cc -target arm-linux-musleabihf -mcpu=cortex_a53 -O2 -fPIC -ffunction-sections -fdata-sections "$@"
+exec zig cc -target arm-linux-musleabihf -mcpu=cortex_a8 -O2 -fPIC -ffunction-sections -fdata-sections "$@"

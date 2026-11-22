@@ -7,10 +7,34 @@ pub struct Config {
     /// Above 1 darkens mid-grays so pale Windows UI stays visible on e-ink.
     pub gamma: f32,
     pub fbink: Option<String>,
+    /// Refresh the screen through the fbink tool even where the direct way works.
+    pub refresh_fbink: bool,
+    pub touch: TouchFix,
+    pub touch_device: Option<String>,
+}
+
+/// Corrections for a touch screen whose axes do not match the screen's.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TouchFix {
+    pub swap_xy: bool,
+    pub mirror_x: bool,
+    pub mirror_y: bool,
+}
+
+impl TouchFix {
+    /// A raw position, each axis given with its maximum, as a framebuffer pixel.
+    pub fn place(self, x: (i32, i32), y: (i32, i32), fb_w: i32, fb_h: i32) -> (i32, i32) {
+        let (x, y) = if self.swap_xy { (y, x) } else { (x, y) };
+        let scaled = |(at, max): (i32, i32), size: i32, mirror: bool| {
+            let pixel = (at as i64 * size as i64 / (max as i64 + 1)) as i32;
+            if mirror { size - 1 - pixel } else { pixel }
+        };
+        (scaled(x, fb_w, self.mirror_x), scaled(y, fb_h, self.mirror_y))
+    }
 }
 
 pub fn parse(text: &str) -> Result<Config, String> {
-    let mut c = Config { scale: 200, gamma: 1.0, fbink: None };
+    let mut c = Config { scale: 200, gamma: 1.0, fbink: None, refresh_fbink: false, touch: TouchFix::default(), touch_device: None };
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -25,6 +49,24 @@ pub fn parse(text: &str) -> Result<Config, String> {
             "host" | "port" | "user" | "domain" | "password" | "fast_waveform" => {}
             "gamma" => c.gamma = value.parse().ok().filter(|g| (0.5..=3.0).contains(g)).ok_or(number("gamma (0.5-3.0)"))?,
             "fbink" => c.fbink = Some(value),
+            "refresh" => {
+                c.refresh_fbink = match value.as_str() {
+                    "fbink" => true,
+                    "direct" => false,
+                    _ => return Err(number("refresh (direct or fbink)")),
+                }
+            }
+            "touch" => {
+                for word in value.split_whitespace() {
+                    match word {
+                        "swap_xy" => c.touch.swap_xy = true,
+                        "mirror_x" => c.touch.mirror_x = true,
+                        "mirror_y" => c.touch.mirror_y = true,
+                        _ => return Err(number("touch (swap_xy, mirror_x, mirror_y)")),
+                    }
+                }
+            }
+            "touch_device" => c.touch_device = Some(value),
             _ => return Err(format!("line {}: unknown key '{key}'", n + 1)),
         }
     }
@@ -56,7 +98,22 @@ mod tests {
     fn parses_and_defaults() {
         // a file from the first version: its server keys are ignored
         let c = parse("# my pc\r\nhost = 192.168.1.10\r\nuser=steve\r\npassword = p#a=s s \r\n\r\nscale=150\n").unwrap();
-        assert_eq!(c, Config { scale: 150, gamma: 1.0, fbink: None });
+        assert_eq!((c.scale, c.gamma, c.fbink, c.refresh_fbink, c.touch, c.touch_device), (150, 1.0, None, false, TouchFix::default(), None));
+    }
+
+    #[test]
+    fn hardware_overrides() {
+        let c = parse("refresh = fbink\ntouch = swap_xy mirror_y\ntouch_device = /dev/input/event2").unwrap();
+        assert!(c.refresh_fbink && c.touch.swap_xy && c.touch.mirror_y && !c.touch.mirror_x);
+        assert_eq!(c.touch_device.as_deref(), Some("/dev/input/event2"));
+        assert!(parse("refresh = fast").is_err());
+        assert!(parse("touch = upside_down").is_err());
+        // a 600x800 panel whose touch axes run to 4095
+        let plain = TouchFix::default();
+        assert_eq!(plain.place((0, 4095), (4095, 4095), 600, 800), (0, 799));
+        assert_eq!(c.touch.place((0, 4095), (4095, 4095), 600, 800), (599, 799));
+        let mirrored = TouchFix { mirror_x: true, ..plain };
+        assert_eq!(mirrored.place((0, 4095), (0, 4095), 600, 800), (599, 0));
     }
 
     #[test]

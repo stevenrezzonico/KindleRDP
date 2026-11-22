@@ -11,8 +11,10 @@ use std::sync::OnceLock;
 
 use anyhow::{Context as _, bail};
 
+use crate::config::TouchFix;
 use crate::gesture::{MtParser, Touch};
 use crate::rects::{Rect, Rotation, Wave};
+use crate::ui::Canvas;
 
 /// Root-only ext partition: survives reboots and is not exposed over USB.
 pub const STATE_DIR: &str = "/var/local/kindlerdp";
@@ -116,7 +118,8 @@ impl Fb {
         self.gamma = std::array::from_fn(|i| ((i as f32 / 255.0).powf(gamma) * 255.0).round() as u8);
     }
 
-    pub fn open(gamma: f32, rotation: Rotation) -> anyhow::Result<Self> {
+    /// `via_fbink` refreshes through the fbink tool from the start (`refresh = fbink`).
+    pub fn open(gamma: f32, rotation: Rotation, via_fbink: bool) -> anyhow::Result<Self> {
         let f = OpenOptions::new().read(true).write(true).open("/dev/fb0").context("open /dev/fb0")?;
         let mut var = [0u32; 40]; // struct fb_var_screeninfo: 0 = xres, 1 = yres, 6 = bits_per_pixel
         let mut fix = FixInfo::default();
@@ -129,6 +132,9 @@ impl Fb {
             bail!("framebuffer ioctl failed: {}", std::io::Error::last_os_error());
         }
         let (fb_w, fb_h, bpp) = (var[0] as i32, var[1] as i32, var[6]);
+        // For reports from Kindle models nobody has tested.
+        let id = String::from_utf8_lossy(&fix.id);
+        eprintln!("screen: '{}' {fb_w}x{fb_h}, {bpp} bpp, line {} bytes, rotate {}", id.trim_end_matches('\0'), fix.line_length, var[34]);
         if bpp != 8 {
             bail!("unsupported screen: {bpp} bits per pixel (only 8-bit gray)");
         }
@@ -151,7 +157,7 @@ impl Fb {
             rotation,
             gamma: [0; 256],
             marker: Cell::new(0),
-            via_fbink: Cell::new(false),
+            via_fbink: Cell::new(via_fbink),
         };
         fb.set_gamma(gamma);
         Ok(fb)
@@ -189,9 +195,24 @@ impl Fb {
         });
     }
 
-    /// Copy `r` from a gray image (the app's own screens).
-    pub fn blit_gray(&self, gray: &[u8], img_w: usize, r: Rect) {
-        self.draw(r, |x, y| gray[y * img_w + x]);
+    /// The app's own screens are laid out for a 300 dpi panel. The small, coarser panels
+    /// (600x800, 758x1024) get them drawn at twice the panel size and shown at half size.
+    pub fn zoom(&self) -> i32 {
+        if self.fb_w.min(self.fb_h) < 1000 { 2 } else { 1 }
+    }
+
+    /// Copy `r` of a canvas `zoom()` times the size of the panel (the app's own screens).
+    /// Returns the panel area written.
+    pub fn blit_gray(&self, canvas: &Canvas, r: Rect) -> Rect {
+        let z = self.zoom();
+        let (x, y) = (r.x / z, r.y / z);
+        let out = Rect { x, y, w: (r.x + r.w + z - 1) / z - x, h: (r.y + r.h + z - 1) / z - y };
+        if z == 1 {
+            self.draw(out, |x, y| canvas.buf[y * canvas.w as usize + x]);
+        } else {
+            self.draw(out, |x, y| canvas.reduced(x as i32, y as i32, z));
+        }
+        out
     }
 
     pub fn refresh(&self, r: Rect, wave: Wave) {
@@ -244,15 +265,19 @@ pub struct TouchScreen {
     max_y: i32,
     fb_w: i32,
     fb_h: i32,
+    fix: TouchFix,
 }
 
 impl TouchScreen {
-    pub fn open(fb_w: i32, fb_h: i32) -> anyhow::Result<Self> {
-        for entry in fs::read_dir("/dev/input")?.flatten() {
-            if !entry.file_name().to_string_lossy().starts_with("event") {
-                continue;
-            }
-            let Ok(file) = File::open(entry.path()) else { continue };
+    pub fn open(fb_w: i32, fb_h: i32, fix: TouchFix, device: Option<&str>) -> anyhow::Result<Self> {
+        let mut paths: Vec<PathBuf> = match device {
+            Some(path) => vec![path.into()],
+            None => fs::read_dir("/dev/input")?.flatten().map(|e| e.path()).collect(),
+        };
+        paths.retain(|p| device.is_some() || p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("event")));
+        paths.sort(); // the same choice on every start
+        for path in paths {
+            let Ok(file) = File::open(&path) else { continue };
             let fd = file.as_raw_fd();
             let mut abs_bits = [0u8; 8];
             let mut info = [[0i32; 6]; 2]; // struct input_absinfo: value, minimum, maximum, ...
@@ -266,11 +291,17 @@ impl TouchScreen {
             if !multitouch || info[0][2] <= 0 || info[1][2] <= 0 {
                 continue;
             }
-            // SAFETY: EVIOCGRAB takes an int argument.
-            unsafe { libc::ioctl(fd, ioc(1, 0x90, 4) as _, 1 as libc::c_int) };
-            return Ok(Self { file, parser: MtParser::default(), max_x: info[0][2], max_y: info[1][2], fb_w, fb_h });
+            let mut name = [0u8; 64];
+            // SAFETY: EVIOCGNAME writes at most the 64 bytes encoded in the request; EVIOCGRAB takes an int.
+            unsafe {
+                libc::ioctl(fd, ioc(2, 0x06, 64) as _, name.as_mut_ptr());
+                libc::ioctl(fd, ioc(1, 0x90, 4) as _, 1 as libc::c_int);
+            }
+            let name = String::from_utf8_lossy(&name);
+            eprintln!("touch: {} '{}', x to {}, y to {}, {fix:?}", path.display(), name.trim_end_matches('\0'), info[0][2], info[1][2]);
+            return Ok(Self { file, parser: MtParser::default(), max_x: info[0][2], max_y: info[1][2], fb_w, fb_h, fix });
         }
-        bail!("no touch screen found in /dev/input")
+        bail!("no multitouch screen found (touch_device in config.ini names one)")
     }
 
     pub fn fd(&self) -> RawFd {
@@ -292,8 +323,7 @@ impl TouchScreen {
             self.parser.feed(kind, code, value, &mut raw);
         }
         let place = |x: i32, y: i32| {
-            let fx = (x as i64 * self.fb_w as i64 / (self.max_x as i64 + 1)) as i32;
-            let fy = (y as i64 * self.fb_h as i64 / (self.max_y as i64 + 1)) as i32;
+            let (fx, fy) = self.fix.place((x, self.max_x), (y, self.max_y), self.fb_w, self.fb_h);
             rotation.point_from_fb(fx, fy, self.fb_w)
         };
         out.extend(raw.into_iter().map(|t| match t {

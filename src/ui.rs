@@ -96,6 +96,25 @@ impl Canvas {
         self.label(r, font, text, if inverted { WHITE } else { BLACK });
     }
 
+    /// Pixel (x, y) of this canvas shown at 1/z of its size. A block that is part black and
+    /// part white takes the colour that is rarer around it: thin strokes then survive both
+    /// as black on white and as white on black, and the result is still black and white.
+    pub fn reduced(&self, x: i32, y: i32, z: i32) -> u8 {
+        let dark = |x0: i32, y0: i32, size: i32| {
+            let (xs, ys) = (x0.max(0)..(x0 + size).min(self.w), y0.max(0)..(y0 + size).min(self.h));
+            let count = ys.clone().map(|y| xs.clone().filter(|x| self.buf[(y * self.w + x) as usize] < 128).count()).sum::<usize>();
+            (count, xs.len() * ys.len())
+        };
+        match dark(x * z, y * z, z) {
+            (0, _) => WHITE,
+            (count, all) if count == all => BLACK,
+            _ => {
+                let (count, all) = dark((x - 2) * z, (y - 2) * z, 5 * z);
+                if count * 2 > all { WHITE } else { BLACK }
+            }
+        }
+    }
+
     /// Bounding box of the pixels that differ from `other` (same size).
     pub fn diff(&self, other: &Canvas) -> Option<Rect> {
         let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, -1, -1);
@@ -417,7 +436,8 @@ impl Form {
 
 pub fn form_screen(c: &mut Canvas, form: &Form, can_delete: bool) -> Areas<FormHit> {
     const BUTTON_H: i32 = 100;
-    const FIELD_H: i32 = 84;
+    // A short screen (1448x1072 lying down) gives up field height so the keys stay 80 high.
+    let field_h = ((c.h - BUTTON_H - 48 - 5 * 80) / FIELDS.len() as i32).clamp(72, 84);
     const LABEL_W: i32 = 180; // "Password" is 128 px wide after the margin
     let mut areas = Vec::new();
 
@@ -433,9 +453,9 @@ pub fn form_screen(c: &mut Canvas, form: &Form, can_delete: bool) -> Areas<FormH
 
     let fields_y = BUTTON_H + 40;
     for (i, label) in FIELDS.iter().enumerate() {
-        let y = fields_y + i as i32 * FIELD_H;
-        let boxed = Rect { x: LABEL_W, y: y + 4, w: c.w - LABEL_W - MARGIN, h: FIELD_H - 8 };
-        c.text(MARGIN, y + (FIELD_H - 32) / 2, Font::Small, label, BLACK);
+        let y = fields_y + i as i32 * field_h;
+        let boxed = Rect { x: LABEL_W, y: y + 4, w: c.w - LABEL_W - MARGIN, h: field_h - 8 };
+        c.text(MARGIN, y + (field_h - 32) / 2, Font::Small, label, BLACK);
         c.frame(boxed, if i == form.active { 6 } else { 2 });
         let kept = i == PASSWORD && form.saved_password && form.fields[i].is_empty();
         let mut value = match i {
@@ -450,11 +470,11 @@ pub fn form_screen(c: &mut Canvas, form: &Form, can_delete: bool) -> Areas<FormH
         let fit = ((boxed.w - 24) / 32) as usize;
         let tail: String = value.chars().skip(value.chars().count().saturating_sub(fit)).collect();
         c.text(boxed.x + 12, boxed.y + (boxed.h - 64) / 2, Font::Big, &tail, BLACK);
-        areas.push((Rect { x: 0, y, w: c.w, h: FIELD_H }, FormHit::Field(i)));
+        areas.push((Rect { x: 0, y, w: c.w, h: field_h }, FormHit::Field(i)));
     }
 
     // The keyboard fills the bottom.
-    let top = fields_y + FIELDS.len() as i32 * FIELD_H + 8;
+    let top = fields_y + FIELDS.len() as i32 * field_h + 8;
     let key_h = ((c.h - top) / 5).min(150);
     let area = Rect { x: 0, y: c.h - 5 * key_h, w: c.w, h: 5 * key_h };
     areas.extend(keyboard(c, area, &form.keys, false).into_iter().map(|(r, key)| (r, FormHit::Key(key))));
@@ -634,6 +654,60 @@ mod tests {
             form.press(Key::Enter);
             assert_eq!(form.active, 1);
         }
+    }
+
+    /// Every Kindle panel size, as the canvas the screens are drawn on: the two small panels
+    /// doubled (`Fb::zoom`), the others as they are.
+    const CANVASES: [(i32, i32); 6] = [(1200, 1600), (1512, 2048), (1072, 1448), (1236, 1648), (1264, 1680), (1860, 2480)];
+
+    #[test]
+    fn every_screen_fits_every_kindle_panel() {
+        fn check<T: Copy + PartialEq + std::fmt::Debug>(what: &str, (w, h): (i32, i32), areas: &Areas<T>) {
+            for (r, action) in areas {
+                let (x, y) = center(*r);
+                assert_eq!(hit(areas, x, y), Some(*action), "{what} {action:?} is covered at {w}x{h}");
+                assert!(r.x >= 0 && r.y >= 0 && r.x + r.w <= w && r.y + r.h <= h, "{what} {action:?} off screen at {w}x{h}");
+            }
+        }
+        for (w, h) in CANVASES.into_iter().flat_map(|(w, h)| [(w, h), (h, w)]) {
+            let canvas = || Canvas::new(w, h);
+            let mut c = canvas();
+            check("list", (w, h), &list_screen(&mut c, &servers(20), 0));
+            let mut c = canvas();
+            check("settings", (w, h), &settings_screen(&mut c, &SettingsForm::new(200, 1.0)));
+            let mut c = canvas();
+            let dialog = dialog_screen(&mut c, "The certificate of pc0 changed.", &["Keyboard", "Scale", "Disconnect", "Rotate", "Close"]);
+            check("dialog", (w, h), &dialog);
+            assert!(dialog[0].0.y > 80 + 72, "dialog buttons over the text at {w}x{h}");
+            let mut c = canvas();
+            let form = form_screen(&mut c, &Form::new(None, false), true);
+            check("editor", (w, h), &form);
+            let fields_end = form.iter().filter(|(_, a)| matches!(a, FormHit::Field(_))).map(|(r, _)| r.y + r.h).max().unwrap();
+            for (r, action) in &form {
+                // a big glyph is 64 high and a button's frame takes 4 on each side
+                let need = 64 + 8;
+                assert!(r.h >= need, "editor {action:?} is {} high at {w}x{h}", r.h);
+                assert!(!matches!(action, FormHit::Key(_)) || r.y >= fields_end, "editor {action:?} over the fields at {w}x{h}");
+            }
+            // the session keyboard, sized as rdp.rs does on a panel that is not doubled
+            let key_h = (h * 9 / 20 / 6).min(110);
+            let mut c = canvas();
+            let keys = keyboard(&mut c, Rect { x: 0, y: h - 6 * key_h, w, h: 6 * key_h }, &Keyboard::default(), true);
+            check("keyboard", (w, h), &keys);
+            assert!(keys.iter().all(|(r, _)| r.h >= 64 + 8 && r.w >= 32 + 16), "keyboard keys too small at {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn half_size_keeps_thin_strokes_black_or_white() {
+        // a 2 px black line on white, off the 2x2 grid, and the same in white on black
+        let mut c = Canvas::new(40, 40);
+        c.fill(Rect { x: 0, y: 20, w: 40, h: 20 }, BLACK);
+        c.fill(Rect { x: 9, y: 0, w: 2, h: 16 }, BLACK);
+        c.fill(Rect { x: 9, y: 24, w: 2, h: 16 }, WHITE);
+        assert_eq!((c.reduced(2, 2, 2), c.reduced(4, 2, 2), c.reduced(5, 2, 2)), (WHITE, BLACK, BLACK));
+        assert_eq!((c.reduced(2, 16, 2), c.reduced(4, 16, 2), c.reduced(5, 16, 2)), (BLACK, WHITE, WHITE));
+        assert_eq!(c.reduced(9, 0, 1), BLACK);
     }
 
     #[test]

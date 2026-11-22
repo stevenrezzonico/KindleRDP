@@ -287,11 +287,13 @@ struct Board {
     fingers: u8,
     /// The finger on a key: its slot and, for a key that repeats, what it types and when next.
     held: Option<(usize, Option<((Key, u8), u64)>)>,
+    /// `Fb::zoom`: the keys are laid out on a canvas this many times the size of the panel.
+    zoom: i32,
 }
 
 impl Board {
     fn area(&self, screen: Rect) -> Rect {
-        let h = (screen.h * 9 / 20 / 6).min(110) * 6;
+        let h = (screen.h * 9 / 20 / 6).min(110 / self.zoom) * 6;
         Rect { y: if self.at_top { 0 } else { screen.h - h }, h, ..screen }
     }
 
@@ -304,18 +306,18 @@ impl Board {
 
     /// Put the keyboard into the framebuffer; returns the part that changed, to refresh.
     fn paint(&mut self, fb: &Fb, screen: Rect) -> Option<Rect> {
-        let mut canvas = Canvas::new(screen.w, screen.h);
+        let z = self.zoom;
+        let mut canvas = Canvas::new(screen.w * z, screen.h * z);
         let area = self.area(screen);
+        let area = Rect { x: area.x * z, y: area.y * z, w: area.w * z, h: area.h * z };
         self.areas = ui::keyboard(&mut canvas, area, &self.keys, true);
         let changed = match &self.shown {
             Some(old) => canvas.diff(old),
             None => Some(area),
         };
-        if let Some(r) = changed {
-            fb.blit_gray(&canvas.buf, screen.w as usize, r);
-        }
+        let on_panel = changed.map(|r| fb.blit_gray(&canvas, r));
         self.shown = Some(canvas);
-        changed
+        on_panel
     }
 
     /// Take a touch that belongs to the keyboard; false leaves it to Windows. A key acts when
@@ -324,7 +326,7 @@ impl Board {
         match touch {
             Touch::Down { slot, x, y } if self.area(screen).contains(x, y) => {
                 self.fingers |= 1 << slot;
-                if let Some(key) = ui::hit(&self.areas, x, y) {
+                if let Some(key) = ui::hit(&self.areas, x * self.zoom, y * self.zoom) {
                     let out = self.keys.press(key);
                     self.keys.pressed = Some(key);
                     self.held = Some((slot, out.filter(|(key, _)| key.repeats()).map(|out| (out, now + REPEAT_START_MS))));
@@ -585,7 +587,7 @@ fn session(
                 return Ok(outcome);
             }
             if choice == 0 {
-                board = if board.is_some() { None } else { Some(Board::default()) };
+                board = if board.is_some() { None } else { Some(Board { zoom: ui.fb.zoom(), ..Board::default() }) };
             }
             // The menu overwrote the session picture: put it back, with a cleaning flash.
             ui.forget();

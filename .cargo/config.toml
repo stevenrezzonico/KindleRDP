@@ -3,7 +3,8 @@
 [target.armv7-unknown-linux-musleabihf]
 linker = "rust-lld"
 # tools/lib/libdl.a is an empty archive: musl keeps dlopen in libc, but a dependency still asks for -ldl.
-rustflags = ["-C", "target-cpu=cortex-a53", "-L", "native=tools/lib"]
+# Cortex-A8 is the oldest CPU in a touch-screen Kindle; newer ones run its code.
+rustflags = ["-C", "target-cpu=cortex-a8", "-L", "native=tools/lib"]
 
 [env]
 CC_armv7_unknown_linux_musleabihf = { value = "tools/zigcc.cmd", relative = true }

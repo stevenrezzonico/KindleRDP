@@ -26,8 +26,8 @@ pub struct Ui {
 
 impl Ui {
     fn canvas(&self) -> Canvas {
-        let (w, h) = self.fb.size();
-        Canvas::new(w, h)
+        let ((w, h), zoom) = (self.fb.size(), self.fb.zoom());
+        Canvas::new(w * zoom, h * zoom)
     }
 
     /// Put `canvas` on the panel, refreshing only the part that differs from what is shown.
@@ -37,8 +37,8 @@ impl Ui {
             None => Some((Rect { x: 0, y: 0, w: canvas.w, h: canvas.h }, std::mem::replace(&mut self.whole, Wave::Mono))),
         };
         if let Some((r, wave)) = changed {
-            self.fb.blit_gray(&canvas.buf, canvas.w as usize, r);
-            self.fb.refresh(r, wave);
+            let on_panel = self.fb.blit_gray(&canvas, r);
+            self.fb.refresh(on_panel, wave);
         }
         self.shown = Some(canvas);
     }
@@ -48,14 +48,15 @@ impl Ui {
         self.shown = None;
     }
 
-    /// Wait for a finger to land; returns where.
+    /// Wait for a finger to land; returns where, in canvas coordinates.
     fn tap(&mut self) -> anyhow::Result<(i32, i32)> {
         let mut touches = Vec::new();
+        let zoom = self.fb.zoom();
         loop {
             device::poll([-1, self.touch.fd()], None)?;
             self.touch.read(self.fb.rotation, &mut touches)?;
             let landed = touches.drain(..).find_map(|t| match t {
-                Touch::Down { x, y, .. } => Some((x, y)),
+                Touch::Down { x, y, .. } => Some((x * zoom, y * zoom)),
                 _ => None,
             });
             if let Some(point) = landed {
@@ -130,9 +131,11 @@ fn run() -> anyhow::Result<()> {
 
     let saved = std::fs::read_to_string(device::state("rotation")).unwrap_or_default();
     let rotation = if saved.trim() == "portrait" { Rotation::Portrait } else { Rotation::Landscape };
-    let fb = Fb::open(settings.gamma, rotation)?;
+    let firmware = std::fs::read_to_string("/etc/prettyversion.txt").unwrap_or_default();
+    eprintln!("KindleRDP {} on {}", env!("CARGO_PKG_VERSION"), firmware.trim());
+    let fb = Fb::open(settings.gamma, rotation, settings.refresh_fbink)?;
     let (fb_w, fb_h) = fb.fb_size();
-    let touch = TouchScreen::open(fb_w, fb_h)?;
+    let touch = TouchScreen::open(fb_w, fb_h, settings.touch, settings.touch_device.as_deref())?;
 
     let servers_path = dir.join("servers.ini");
     // No servers.ini yet: an empty list.

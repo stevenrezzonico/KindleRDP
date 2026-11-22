@@ -2,7 +2,7 @@
 
 A Remote Desktop (RDP) client for jailbroken Kindle e-readers. Connect to a Windows PC and use it on the e-ink screen with touch.
 
-Tested on a Kindle Paperwhite, firmware 5.19.6, jailbroken with Vera. Other MediaTek-based Kindles with an 8-bit gray screen should work; nothing else has been tried.
+Tested on one device only: a Kindle Paperwhite (11th generation, 1236x1648), firmware 5.19.6, jailbroken with Vera. It is written to run on the other touch-screen Kindles too, but nobody has tried: see [Other Kindle models](#other-kindle-models).
 
 ## Features
 
@@ -57,6 +57,26 @@ Letters and symbols arrive right on any Windows keyboard layout. Shortcuts use t
 **Settings** on the server list changes the default Windows display scale and the contrast. A server can have its own scale: the **Scale %** field in its editor, or **Scale** in the menu. Empty means the default. The same values live in `kindlerdp/config.ini`, which the app creates on first start.
 
 If something fails, the reason is shown on screen and written to `kindlerdp/log.txt`.
+
+## Other Kindle models
+
+Only the Paperwhite above is tested. What the code does for the others:
+
+| | Status |
+|---|---|
+| Newer MediaTek models (Paperwhite 11th and 12th generation, Kindle 2022 and 2024, Scribe) | Same screen driver as the tested one. Expected to work. |
+| Older models with a 1072x1448 or 1264x1680 screen (Paperwhite 3 and 4, Voyage, Oasis) | Untested. The screen is refreshed through the `fbink` tool, which is slower. |
+| Models with a 600x800 or 758x1024 screen (Kindle Touch, Kindle 7th to 10th generation, Paperwhite 1 and 2) | Untested. The app's own screens are shown at half size. Set **Windows scale** to 100 or 125 in **Settings**. The oldest of them have a Linux kernel older than Rust supports, so the program may not start at all. |
+| Colour screens (Colorsoft) | Not supported: the app stops with "unsupported screen". |
+| Kindles without a touch screen | Not supported. |
+
+The app is started from the library by a scriptlet, which needs a jailbreak with the Universal Hotfix on a recent firmware.
+
+If it does not work, `kindlerdp/log.txt` starts with the firmware, the screen and the touch screen that were found. These lines in `kindlerdp/config.ini` can help:
+
+- `refresh = fbink`: do not use the direct screen refresh at all.
+- `touch = swap_xy mirror_x mirror_y` (any of the three): when taps land in the wrong place.
+- `touch_device = /dev/input/event1`: when the touch screen is not found or the wrong device is used.
 
 ## Passwords and security
 
