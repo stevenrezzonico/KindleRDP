@@ -62,13 +62,20 @@ If something fails, the reason is shown on screen and written to `kindlerdp/log.
 
 Only the Paperwhite above is tested. What the code does for the others:
 
-| | Status |
+| Screen | Status |
 |---|---|
-| Newer MediaTek models (Paperwhite 11th and 12th generation, Kindle 2022 and 2024, Scribe) | Same screen driver as the tested one. Expected to work. |
-| Older models with a 1072x1448 or 1264x1680 screen (Paperwhite 3 and 4, Voyage, Oasis) | Untested. The screen is refreshed through the `fbink` tool, which is slower. |
-| Models with a 600x800 or 758x1024 screen (Kindle Touch, Kindle 7th to 10th generation, Paperwhite 1 and 2) | Untested. The app's own screens are shown at half size. Set **Windows scale** to 100 or 125 in **Settings**. The oldest of them have a Linux kernel older than Rust supports, so the program may not start at all. |
-| Colour screens (Colorsoft) | Not supported: the app stops with "unsupported screen". |
-| Kindles without a touch screen | Not supported. |
+| 1236x1648 (the tested Paperwhite) | Works. |
+| Other models with a MediaTek processor (2021 and later) | Untested. Same screen driver family as the tested one. |
+| 1072x1448 or 1264x1680 with an older processor | Untested. The screen is refreshed through the `fbink` tool, which is slower. |
+| 600x800 or 758x1024 | Untested. The app's own screens are shown at half size. Set **Windows scale** to 100 or 125 in **Settings**. |
+| Colour screen | Not supported: the app stops with "unsupported screen". |
+| No touch screen | Not supported. |
+
+Known reasons it may not run on an older Kindle:
+
+- Kindles from before about 2017 run a Linux kernel (2.6 or 3.0) older than the oldest one Rust supports (3.2). The program may not start.
+- The touch screen must report touches the way current ones do (multitouch protocol B). The first touch-screen Kindles may not.
+- The launcher is not checked against old firmware.
 
 The app is started from the library by a scriptlet, which needs a jailbreak with the Universal Hotfix on a recent firmware.
 

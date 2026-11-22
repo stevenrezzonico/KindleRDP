@@ -658,7 +658,7 @@ mod tests {
 
     /// Every Kindle panel size, as the canvas the screens are drawn on: the two small panels
     /// doubled (`Fb::zoom`), the others as they are.
-    const CANVASES: [(i32, i32); 6] = [(1200, 1600), (1512, 2048), (1072, 1448), (1236, 1648), (1264, 1680), (1860, 2480)];
+    const CANVASES: [(i32, i32); 7] = [(1200, 1600), (1512, 2048), (1516, 2048), (1072, 1448), (1236, 1648), (1264, 1680), (1860, 2480)];
 
     #[test]
     fn every_screen_fits_every_kindle_panel() {
